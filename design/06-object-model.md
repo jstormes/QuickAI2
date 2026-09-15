@@ -36,10 +36,24 @@ classDiagram
     class Session {
         +SessionId id
         +PrincipalId owner
+        +AccessToken token
+        +SessionState state
+        +TurnState turn
         +TeamId activeTeam
+        +String clientKind
+        +ToolDefinition[] clientTools
+        +ClassifierRule[] rules
+        +String instructions
+        +Memory[] scratch
+        +Map~SkillId,LoadedSkill~ loadedSkills
+        +Map~String,PendingClientCall~ pendingClientCalls
+        +JobId[] pendingJobResults
+        +TurnId[] unminedTurns
+        +MemoryCandidate[] unminedCandidates
+        +Set~TurnId~ minedTurns
+        +boolean frozen
         +createdAt
-        +sendUserMessage(text)
-        +cancel(turnId)
+        +lastSeenAt
     }
     class Conversation {
         +Message[] messages
@@ -116,9 +130,29 @@ classDiagram
         +ClassifierRule[] rules
         +ScoredMemory[] memories
         +ModelOutput modelOutput
-        +Map~String,Verdict~ verdicts
+        +Map~String,AuditState~ audit
         +MemoryCandidate[] candidates
+        +Map~String,PendingApproval~ pendingApprovals
+        +Map~String,ToolHandle~ runningTools
+        +ToolCall[] callsThisTurn
+        +RecallQuery recallQuery
+        +DiscoverQuery discoverQuery
+        +Memory[] recalled
+        +AssembledPrompt assembled
+        +boolean promptDirty
+        +boolean memoriesDirty
+        +Map~String,Layer[]~ shadowLog
+        +Path workspace
+        +TurnId turnId
         +put(accumulator, key, value, locked) boolean
+        +snapshot() TurnSnapshot
+    }
+    class AuditState {
+        +boolean decided
+        +boolean shielded
+        +Verdict verdict
+        +ClassifierRule askedBy
+        +String[] trace
     }
     class OuterChain {
         +Layer[] layers
@@ -247,10 +281,10 @@ Which steps run at which hook (standard set):
 
 | Hook                  | Steps                                                                 |
 |-----------------------|-----------------------------------------------------------------------|
-| `on_message`          | GateStep, PromptFragmentsStep, SkillDiscoveryStep, ToolDefinitionsStep, MemorySearchStep, RuleLoadStep |
-| `on_tool_call`        | StaticRulesStep per layer; ModelAuditStep appended by the service     |
-| `on_memory_candidate` | RouteToTeamStep (team layers), RouteToPersonalStep (user layer)       |
-| `on_turn_end`         | audit / metrics steps                                                 |
+| `on_message`          | GateStep, PromptFragmentsStep, SkillDiscoveryStep, SkillAutoLoadStep, LoadedSkillsStep (implicit), ToolDefinitionsStep, MemorySearchStep, RuleLoadStep |
+| `on_tool_call`        | RiskEscalationStep + ScopeGateStep (service, first); StaticRulesStep per layer; ModelAuditStep (service, last) |
+| `on_memory_candidate` | MiningRetagStep + RouteToTeamStep (team layers), RouteToPersonalStep (user layer), ScratchAcceptStep (session); restrictive mining rules run once before this hook |
+| `on_turn_end`         | AuditLogStep, metrics steps                                            |
 
 Precedence per accumulator on `put`:
 
@@ -318,6 +352,15 @@ classDiagram
         +ToolMode mode
         +boolean locked
         +Layer layer
+        +ToolOrigin origin
+        +Capability[] requires
+        +Capability[] granted
+        +Risk effectiveRisk
+    }
+    class ToolOrigin {
+        +OriginKind kind
+        +String skillName
+        +Layer skillLayer
     }
     class ToolImpl {
         <<abstract>>
@@ -463,9 +506,14 @@ classDiagram
         +Layer layer
         +Audience suggestedAudience
         +MemoryId promotedFrom
+        +MemoryId supersededBy
+        +PrincipalId owner
+        +float confidence
+        +boolean pinned
         +SourceId source
         +createdAt
         +updatedAt
+        +usedAt
         +float[] embedding
     }
     class ScoredMemory {
@@ -479,6 +527,15 @@ classDiagram
         +String rationale
         +float confidence
         +Audience audience
+        +String[] tags
+        +MemoryId[] links
+        +MemoryId[] supersedes
+        +Provenance provenance
+        +Declined[] declined
+        +Audience suggestedAudience
+        +MemoryId promotedFrom
+        +TurnId sourceTurn
+        +String hash
     }
     class MemoryRouter {
         +route(MemoryCandidate, AccessToken, Session) Layer

@@ -31,7 +31,13 @@ main(config_path):
   steps.register("static_rules",      StaticRulesStep)
   steps.register("route_to_team",     RouteToTeamStep)
   steps.register("route_to_personal", RouteToPersonalStep)
-  steps.register("audit_log",         AuditLogStep)
+  steps.register("retag",             MiningRetagStep)        # widening mining rules of this layer (§6d)
+  steps.register("auto_load",         SkillAutoLoadStep)      # trigger-based skill auto-load (§15e)
+  steps.register("audit_log",         AuditLogStep)           # on_turn_end: persists this turn's verdict trace to the audit store (§8g)
+  # Implicit steps the factory always adds, never configured:
+  #   LoadedSkillsStep  (every layer, on_message)  re-puts tools/fragments of skills loaded at that layer (§15f)
+  #   RiskEscalationStep, ScopeGateStep (service, first in on_tool_call), ModelAuditStep (service, last)  (§8c, §8d)
+  #   the SessionLayer's own steps (§14a)
 
   # --- shared, service-level singletons
   model      = ModelClientFactory.create(config.model)              # e.g. anthropic adapter
@@ -58,6 +64,28 @@ main(config_path):
   api.listen()                                                       # HTTP + SSE
 ```
 
+Step protocol (what the factory and the hooks rely on):
+
+```
+Step {
+  kind: gating | contributing            # declared by the step class; the registry records it
+  run(ctx, payload) -> Continue | Stop   # gating steps implement run directly
+}
+ContributingStep(Step) {
+  fetch(ctx, payload) -> result          # I/O only; may run concurrently with other layers' fetches (§3a)
+  apply(ctx, result)  -> None            # pure; applied in chain order; may call ctx.put
+  run(ctx, payload) = apply(ctx, fetch(ctx, payload)); return Continue      # sequential form, used by outbound hooks
+}
+# Fail modes are derived from kind unless the config overrides them:
+#   gating       -> FailClosedStep (backend down => Stop(Deny("policy source unavailable")))
+#   contributing -> FailOpenStep   (backend down => contributes nothing; context_ready reports it)
+#   required: true on a contributing step wraps it in RequiredStep instead: backend down => the turn fails with
+#             error{code: source_unavailable, source}. Only allowed on contributing steps; config validation rejects it on gating ones.
+# Routing steps (RouteToTeamStep, RouteToPersonalStep) are contributing: a failed store write logs, emits
+#   memory_discarded(reason=store_error), pushes the candidate to session.unmined_candidates for the next mining
+#   job, and returns Continue so the next layer may still accept it.
+```
+
 `LayerFactory.for_entry`, called by `prebuild` and lazily later:
 
 ```
@@ -76,6 +104,20 @@ LayerFactory.for_entry(entry, token=None) -> Layer:
           chain.append(step)
       layer.hooks[hook_name] = chain
   return layer
+```
+
+Malformed source content is handled per item, never per source:
+
+```
+Source.items(token):                                 # every adapter, every resource kind
+  for raw in read_all():
+      item = validate(raw, schema_for(kind))         # front matter / yaml / json schema; tool input_schema must compile
+      if item.error:  emit(source_item_invalid, source, raw.id, item.error); audit_log(...); continue   # skip it
+      if item.id in seen: warn(duplicate id, first wins); continue
+      seen.add(item.id); yield item
+# Skill-specific: a tool whose `requires` exceeds Skill.permissions is clipped (tools.on_excess) with a warning;
+# a tool whose input_schema does not compile is hidden. A source that cannot be read at all is "unreachable" and the
+# step's fail mode applies (§Step protocol above).
 ```
 
 ## 2. Client logs in and opens a session
@@ -158,7 +200,7 @@ AgentCore.run_turn(session, message):
   # phase 1: gates, sequential, outer order
   for layer in chain:
       for step in layer.hooks.on_message.gating():
-          if (r := step.run(ctx)) is Stop: emit(r.action); return
+          if (r := step.run(ctx)) is Stop: return end_turn_early(ctx, r.action)   # see below
   # e.g. global GateStep(rate_limit): 12/60 this minute -> Continue
 
   # phase 2: fetch concurrently, apply in order
@@ -206,6 +248,36 @@ Merge steps and the model call:
   system_prompt = assembler.assemble(ctx.prompt, budget=config.prompt_budget)
   tool_defs     = [t.definition for t in ctx.tools.values()] + skill_summaries(ctx.skills)
   emit(context_ready, timings=per_layer(results), counts=...)
+```
+
+Stopping before the model, and the other ways a turn ends:
+
+```
+end_turn_early(ctx, action):
+  match action:
+    Deny(reason):    emit(turn_denied, reason); session.conversation.append(system_note(f"turn denied: {reason}"))  # keeps history append-only
+                     emit(turn_complete, outcome=denied); no mining
+    Respond(text):   session.conversation.append(assistant(text)); emit(assistant_message, text); emit(turn_complete, outcome=responded); mining runs
+    RequireApproval: not valid in on_message (config validation rejects a gating rule that asks on messages)
+
+GateStep(config).run(ctx):                                  # the standard on_message gate; declarative like everything else
+  if session.frozen: return Stop(Deny("session frozen"))    # set by POST /sessions/{id}/freeze (owner or read-audit-all holder) or a global rule
+  if rate_limiter(ctx.token.subject).exceeded(): return Stop(Deny("rate limit"))
+  for pat in config.gate.content_deny_patterns: if pat.matches(ctx.inbound.text): return Stop(Deny(pat.reason))
+  return Continue
+
+second POST /messages while session.turn.state != idle:
+  -> 409 { error: turn_in_progress, turn_id }               # client cancels first, or waits for turn_complete
+  (config.messages.queue: reject | queue_one; default reject)
+
+model terminal conditions (agent loop, §3b):
+  stop_reason max_tokens: append the partial assistant text as a normal assistant message;
+                          emit(assistant_message, truncated=true); turn_complete(outcome=max_tokens); mining runs
+  stop_reason refusal:    append assistant("I can't help with that request." + category note); audit_log(refusal, category);
+                          emit(assistant_message, refusal=category); turn_complete(outcome=refusal); mining runs
+  error{fatal}:           emit(error, code=model_error, message); turn_complete(outcome=error); the user message stays in
+                          history (append-only); no assistant turn is added; no mining
+  error{retryable} after SDK retries: same as fatal with code=model_unavailable
 ```
 
 ### 3b. Model call, tool call emitted
@@ -558,7 +630,11 @@ AgentCore.after_turn(ctx):
   #           active_team, rules (mining role), timings
 
 MiningJob.run():
-  if store.mined(turn_id): return                          # at-most-once per turn
+  if session.mined_turns.contains(turn_id): return         # at-most-once per turn; the marker lives on the Session (SessionStore)
+  # Durability: the job queue is in-process. A restart loses queued jobs, but every unmined turn is also
+  # listed in session.unmined_turns (persisted), and the sweeper re-submits them (§11f). Concurrent
+  # mining of two sessions of one user may race on similar candidates; stores make put() idempotent by
+  # candidate hash within config.mining.dedupe_window, so the second write collapses into an update.
   ctx = TurnContext.from_snapshot(snapshot)                # no model call, no stores yet
   turns = [snapshot] + session.take_unmined_turns()        # catch up if earlier turns were skipped
   candidates = mine(ctx, turns)
@@ -581,7 +657,7 @@ mine(ctx, turns) -> [MemoryCandidate]:
                         existing=ctx.memories,               # what was recalled: avoid restating it
                         groups=ctx.token.groups,
                         active_team=ctx.session.active_team,
-                        team_context=[s.layer for s in ctx.skills_loaded] +
+                        team_context=[s.layer for s in ctx.skills_loaded] +          # also copied onto c.provenance.teams for routing
                                      [m.layer for m in ctx.memories],
                         instructions=instructions)
   return [MemoryCandidate(kind=r.kind, body=r.body, rationale=r.why,
@@ -664,6 +740,8 @@ MiningRetagStep(team-a).run(ctx, c):
 RouteToTeamStep(team-a).run(ctx, c):
   T = this_layer.team_id
   if c.audience != team:T: return Continue                # not for us
+  if c.provenance.teams - {T}:                            # the turn drew on ANOTHER team's memories or skills
+      signal = False                                      # no auto-accept: only explicit user confirmation may cross teams
   if not ctx.token.allows("team", "create", "memory") or T not in ctx.token.groups:
       c.declined.append((T, "no scope")); return Continue  # falls through to personal
   signal = (ctx.session.active_team == T) or any(r.auto_accepts(c) for r in this_layer.rules.auto_accept())
@@ -687,8 +765,14 @@ Writing, with dedupe against the target store:
 
 ```
 write_to(store, ctx, c, layer) -> Stop:
-  near = store.search(c.body, top_k=3, filter={kind: c.kind})
-  match classify_overlap(c, near):                          # cheap: embedding sim + normalised text; no model call
+  near = store.search(c.body, ctx.token, top_k=3, filter={kind: c.kind})
+  match classify_overlap(c, near):
+    # No model call here. Three outcomes, decided in this order:
+    #   contradiction: only when the MINER said so. The miner is asked (§6b) to set c.supersedes = [memory ids]
+    #                  when a recalled memory is now wrong; write-time never infers a contradiction.
+    #   duplicate:     hash(normalise(body)) equal, OR (store exposes similarity and sim >= config.mining.dup_threshold
+    #                  [0.92] and same kind). Stores without similarity use hash only.
+    #   new:           otherwise.
     duplicate(m):     store.update(m.id, touch=now(), links+=c.links, confidence=max(...))
                       emit(memory_updated, m.id, layer); return Stop(Accepted)
     contradiction(m): id = store.put(Memory.from(c, layer, supersedes=m.id))
@@ -1030,8 +1114,8 @@ rules:
     role: tool_audit
     kind: deny
     locked: true
-    match: { tool: "shell", tool_layer_in: [global, team] }       # shell defined by a shared skill? never
-    reason: "shell may only come from the built-in tool source"
+    match: { tool: "shell", origin: skill }                       # a skill (any layer) shipping its own "shell"? never
+    reason: "shell may only come from the built-in tool source"   # the built-in shell has origin: source, so it does not match
 
   - id: high-risk-needs-approval
     role: tool_audit
@@ -1074,6 +1158,7 @@ ClassifierRule {
 Match (tool_audit) = all of the present fields must hold:
   tool | tool_in | tool_glob        # by registered name, e.g. "nightly-triage.*"
   tool_layer | tool_layer_in         # layer that put the tool into ctx.tools
+  origin | origin_in                 # source | skill | client (ToolDefinition.origin.kind)
   risk_gte | effective_risk_gte      # declared risk vs. risk after escalation (8c)
   execute_on                         # server | client
   args_match: { field: glob }        # shallow, string-valued args only
@@ -1235,7 +1320,7 @@ Chain: global, team-a, user, session. Rules as in 8a plus team-a
 | Call                               | Path                                                                                      | Result |
 |------------------------------------|-------------------------------------------------------------------------------------------|--------|
 | `ci_status(job=…)`                 | risk low → global locked allow → shielded → team/user restrictions skipped → model audit skipped | run    |
-| `shell(cmd="ls")` (built-in, global)| risk medium → no global match → user `require_approval shell` → ask                       | ask user |
+| `shell(cmd="ls")` (built-in, global)| risk medium → global `no-shell-from-shared-skills` does not match (origin: source) → user `require_approval shell` → ask | ask user |
 | `shell(cmd="rm -rf build/")`       | risk high → global `high-risk-needs-approval` (restrictive, locked) → ask; user rule never reached | ask user, `remember: session` not offered |
 | `shell` defined by a team skill    | RiskEscalation team +1 → global `no-shell-from-shared-skills` deny                        | denied |
 | `nightly-triage.fetch_log(...)`    | risk medium (team +1 → high) → global `high-risk-needs-approval` matches first → ask; team's allow is later and unlocked | ask user |
@@ -1854,7 +1939,9 @@ approval works exactly as in §5c; it never needed the stream.
 
 If the client reconnects with a *new* session instead (it lost its
 session id), the old session goes idle and eventually ends (11e); its
-pending approvals time out to deny; its unmined turns are mined at end.
+pending *tool* approvals time out to deny; pending *memory* approvals are
+owner-scoped, survive session end, and resolve by their own timeout to
+`keep_personal`; its unmined turns are mined at end.
 
 ### 11d. Token refresh and expiry
 
@@ -1929,9 +2016,11 @@ SessionStore {                                   # adapter: memory (dev) | sqlit
   save(session), load(id), list(owner, state?), where(...), purge(id)
 }
 persisted:   id, owner, token claims + raw token encrypted at rest (needed to mine as the user after a restart),
-             state, turn, active_team, client_kind, client_tools, conversation, events (bounded), approvals,
-             unmined_turns, timestamps
-not persisted: chain (rebuilt from token + config on load), stream, ctx of a running turn
+             state, turn, active_team, client_kind, client_tools, client gates (session.rules incl. remembered
+             approvals), instructions, scratch memories, loaded_skills (ids + pinned versions; tools/fragments
+             re-read from the store on load), pending_client_calls (with deadlines), pending_job_results,
+             conversation, events (bounded), approvals, unmined_turns, unmined_candidates, mined_turns, timestamps
+not persisted: chain (rebuilt from token + config on load), stream, ctx of a running turn, the per-call audit state
 ```
 
 ```
@@ -1939,7 +2028,7 @@ on service start:
   for session in sessions.where(turn.state in (running, awaiting_approval)):     # crashed mid-turn
       session.turn.state = idle
       session.events.append(turn_interrupted, turn_id, reason="service restart")  # client sees it on reconnect
-      for a in session.approvals.pending(): a.answer(Deny("service restart"))
+      for a in session.approvals.pending(kind=tool): a.answer(Deny("service restart"))   # memory approvals keep their long window (§5g)
       session.unmined_turns.append(turn_id)                                         # the turn's completed part still gets mined
   sessions.save_all()
 # sessions load lazily on first request; the chain is rebuilt then.
@@ -1948,10 +2037,19 @@ on service start:
 A client that reconnects after a restart replays, sees
 `turn_interrupted`, and may resend its last message.
 
-Multi-node: sessions are single-owner objects, so either route by
-session id (sticky) or hold a per-session lease in the shared store and
-proxy requests to the lease holder. Either way, one node runs a
-session's turns at a time; the design needs no cross-node fan-out.
+Multi-node (sketch, single-node is the v1 target):
+
+```
+lease:      SessionStore holds {session_id -> node_id, expires_at}; a node renews its leases every lease_ttl/3.
+routing:    a request for a session the node does not hold is proxied to the lease holder (or the holder is
+            re-leased by this node if the lease expired). One node runs a session's turns and owns its EventBus.
+publish:    ServiceBus.publish_to_owner and JobRunner.emit look up the owner's session lease and forward the
+            publish to the holder over the internal channel (config.cluster.channel: redis | nats | http);
+            the holder assigns seq and appends to the log, so ordering is unchanged.
+jobs:       JobStore rows carry a lease too; any node may adopt an orphaned running job whose runner can reattach
+            (http-polled, container); subprocess jobs die with their node and are marked interrupted.
+sweepers:   run on every node over the sessions and jobs that node leases.
+```
 
 ### 11g. Starting a new session with context
 
@@ -2075,15 +2173,18 @@ execute(call, ctx) -> ToolResult:
   emit(tool_call_finished, call.id, ok=result.ok, duration=result.duration, truncated=result.truncated)
   return result
 
-needs_sandbox(d):  d.impl is script and precedence(d.layer) < precedence(config.tools.sandbox.required_below_layer)
-                   or d.impl is script and config.tools.sandbox.always
+needs_sandbox(d):  d.impl is script                              # every script impl is sandboxed, whatever its layer;
+                                                                  # the *policy* (mounts, network) is looser for user-layer
+                                                                  # scripts, but nothing runs as the service account
 ```
 
 ### 12c. Runners
 
 ```
 BuiltinRunner.run(d, args, ctx):
-  fn = builtins[d.impl.ref]
+  if d.origin.kind != source or d.layer not in config.tools.builtin_refs_allowed_from:   # default [global]
+      return ToolResult.error("builtin impls are only allowed for tools from a trusted tool source", kind="capability")
+  fn = builtins[d.impl.ref]                           # a skill can therefore never alias a builtin under another name
   host = HostApi(granted=d.granted, ctx=ctx)          # builtins never touch the OS directly; they call host.*
   return fn(args, host)
 
@@ -2105,7 +2206,7 @@ HttpRunner.run(d, args, ctx):
 
 ScriptRunner.run(d, args, ctx):                       # always wrapped by SandboxedRunner when required
   runtime = config.tools.runtimes[d.impl.runtime] or fail("runtime not allowed")
-  entry   = materialise(d.impl.entry, ctx.workspace)   # copy the skill resource into the call workspace
+  entry   = materialise(d.impl.entry, ctx.workspace)   # copy the skill resource into the call workspace (confined path, §15g)
   proc = spawn([runtime, entry], stdin=json(args), env=env_for(d), cwd=ctx.workspace)
   return ToolResult.from_process(proc)                 # stdout is the result (json if parseable, else text); stderr captured
 
@@ -2219,6 +2320,7 @@ TimeoutRunner:     wall clock; on expiry handle.kill() (sandbox: kill the cgroup
 
 cancel_turn(session):                                 # POST /sessions/{id}/cancel
   for h in ctx.running_tools.values(): h.kill()       # results become kind=cancelled; workspaces removed
+  for a in session.approvals.pending(kind=tool): a.answer(Deny("turn cancelled"))   # memory approvals are untouched
   ...
 
 # client-executed tools
@@ -2750,7 +2852,8 @@ locked: false
 
 SkillStore.discover(query: DiscoverQuery, token) -> [SkillSummary]      # cheap; store may keep an index of description+triggers
 SkillStore.load(id) -> Skill                                            # full body; version = content hash or commit
-SkillStore.resource(id, path) -> bytes                                  # size-capped
+SkillStore.resource(id, path) -> bytes                                  # size-capped; path confined: normalised, no "..", no absolute,
+                                                                        # no symlink escaping the skill folder; else 400/not found
 SkillStore.load_version(id, version) -> Skill?                          # git can; http may not (§7e)
 
 GitSkillStore: clone at first use, `fetch` on refresh (TTL or /sources/refresh); version = tree hash of the skill folder
@@ -3018,6 +3121,13 @@ Conversation rules the core keeps so any adapter can cache and replay:
 - **All tool results of one assistant turn go back in one user message**,
   in the order the calls were made, failures as `is_error: true`. Never
   split them across messages and never drop a failed one.
+- **Attachments.** `user_message.attachments[]` are `{asset_ref}` (uploaded
+  first via `POST /sessions/{id}/assets`, owner-checked, size-capped by
+  `config.assets.max_kb`) or inline base64 up to `config.assets.inline_kb`.
+  The core renders them as `image` / `document` blocks in the user
+  message; binaries are never redacted (only text is), the miner sees
+  file names and types only, and attachments count toward the context
+  check below.
 - **Context-window overflow** is checked by the core before every model
   call and handled without rewriting history:
 

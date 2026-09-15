@@ -45,9 +45,9 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
 - ~~Session persistence across API restarts.~~ Resolved in
   `08-walkthrough.md` §11f: a pluggable `SessionStore`; running turns at
   crash time become `turn_interrupted`; the chain is rebuilt on load.
-- **Raw token at rest.** Mining after a restart needs the user's token,
-  so the session store keeps it encrypted. Alternative: drop post-restart
-  mining and never persist raw tokens. Which does the deployment prefer?
+- ~~Raw token at rest.~~ Resolved as a config switch:
+  `sessions.token_at_rest: encrypted | never` (`02-layering-and-composition.md`
+  config reference); `never` disables post-restart mining.
 - ~~Embedding ownership.~~ Resolved in `08-walkthrough.md` §10g: stores
   own embedding; a shared embedder is optional config; cross-store
   ranking uses RRF so scores never need to be comparable. Cross-encoder
@@ -79,6 +79,10 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
 - **Secrets via egress proxy.** Attaching secrets at the proxy keeps them
   out of the sandbox entirely, but couples the secret to a host pattern.
   Is per-host attachment enough, or do some tools need the raw value?
+- **Skill source signing.** The threat model (`09-threat-model.md`)
+  treats the global repo as production config but verifies nothing.
+  Should git-backed stores require signed commits or a review gate
+  before a new version is served?
 - ~~Tool schema versioning.~~ Resolved in §15h: a loaded skill is pinned
   to its version for the session; refresh emits `skill_outdated`; reload
   re-puts tools at the new version.
@@ -127,10 +131,9 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
   context. No generic `LayeredResource<T>` needed.
 - ~~Handler granularity.~~ Resolved by `decisions/0009-chain-of-chains.md`:
   a layer is an inner chain of small steps per hook; one step per source.
-- **Step failure modes.** Default is fail closed for gating steps and fail
-  open for contributing steps. Should a layer be able to declare a
-  contributing step `required` (e.g. org policy prompt) so its outage
-  fails the turn?
+- ~~Step failure modes.~~ Resolved: `kind: gating | contributing` on
+  every step drives the default; `required: true` on a contributing
+  step fails the turn (`08-walkthrough.md` §1, `decisions/0011`).
 - ~~Client-supplied session steps.~~ Resolved in `08-walkthrough.md`
   §14c: clients register declarative *gates* (rules with fixed match
   fields, restrictive only, unlocked), never steps or code.

@@ -31,7 +31,7 @@ git@github.com:jstormes/QuickAI2.git; commit design changes as you go.
   `07-turn-pipeline.md` is the spine: the chain of layer handlers,
   `05-design-patterns.md` names the patterns, `06-object-model.md` is the
   UML class model in Mermaid, `08-walkthrough.md` is pseudocode for
-  startup and one turn with a tool call)
+  every flow, `09-threat-model.md` names the trust boundaries)
 - `decisions/` – short notes recording decisions and why they were made
 
 ## When this changes

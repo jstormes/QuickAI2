@@ -97,3 +97,76 @@ api:
   flag can opt a source into hard failure (e.g. org policy prompt).
 - Caching per source (with TTL) is an adapter concern but the handler
   should expose "refresh" so a front end can offer a reload command.
+
+## Configuration reference (defaults)
+
+Every `config.*` key the walkthrough uses, with its default. A key not
+listed here is a bug in the notes, not an implementer's decision.
+
+| Key | Default | Notes |
+|---|---|---|
+| `users_root` | required | per-subject root for `${user_root}`; single-user mode: `~/.agent` with `subject: local` |
+| `layers[]` | required | outer chain; `global` always present; see `07-turn-pipeline.md` |
+| `sources.git.push_interval_s` | 0 (push per write) | git-backed writers |
+| `model.adapter` / `model.agent.model` | `anthropic` / deployment's choice | see `08-walkthrough.md` §16f |
+| `model.agent.max_output` / `effort` | 16000 / `high` | |
+| `model.timeout_s` / `max_retries` | 600 / 2 | |
+| `model.cache.ttl` | 5m | |
+| `context.reserve` | 8000 tokens | headroom kept below the window |
+| `context.overflow` | `provider_compaction` if the adapter supports it, else `exhaust` | |
+| `prompt_budget` | window − reserve − conversation estimate | |
+| `prompt.provenance_comments` | false (true for `GET /prompt`) | |
+| `classifier.engine` / `model` | `model` / deployment's choice | |
+| `classifier.audit_deadline_s` | 2.5 | the sub-second *goal* is a target, this is the hard cap |
+| `classifier.thresholds.allow` / `deny` | 0.85 / 0.15 | |
+| `classifier.undecided_default` | `ask_if_risk_gte_medium_else_allow` | values: `allow`, `ask`, `deny`, `ask_if_risk_gte_<level>_else_allow` |
+| `classifier.window` / `prompt_budget` | 8 messages / 4000 tokens | |
+| `memory.k_per_store` / `max_recalled` / `max_per_kind` | 8 / 6 / 3 | |
+| `memory.min_score` / `half_life` | 0.0176 (RRF) / off | |
+| `memory.layer_boost` | user 1.2, team 1.1, global 1.0 | |
+| `memory.merge` / `embedder` | `rrf` / per store | |
+| `memory.step_timeout_ms` | 300 | per layer search step |
+| `mining.min_token_ttl` | 60 s | queue the turn if the token expires sooner |
+| `mining.dup_threshold` / `dedupe_window` | 0.92 / 24 h | |
+| `mining.confirm_timeout_s` | 86400 | `on_timeout: keep_personal` |
+| `skills.sticky` / `max_loaded` / `k_per_layer` / `resource_kb` | `session` / 6 / 5 / 256 | |
+| `tools.ceilings.<layer>` | required per configured layer | |
+| `tools.sandbox.kind` / `uid` | `subprocess_restricted` / required | every script impl is sandboxed |
+| `tools.runtimes` | `{}` (no scripts allowed) | allowlist |
+| `tools.limits.*` | wall 60 s, cpu 30 s, mem 512 MB, pids 64, stdout 256 KB, result 64 KB | |
+| `tools.risk_escalation` | team +1, `global-from-skill` +1, session +1 | keyed by `origin`/layer |
+| `tools.builtin_refs_allowed_from` | `[global]` | |
+| `tools.on_excess` | `hide` | or `degrade` |
+| `tools.client_risk_floor` / `client_wall_s` / `client_result_kb` | `low` / 300 / 64 | |
+| `tools.max_concurrent` / `rate.session` / `rate.<tool>` | 4 / 60 per min / none | |
+| `tools.redact_patterns` | built-in secret patterns | plus `secrets.known_values()` |
+| `jobs.*` | see `08-walkthrough.md` §13g | |
+| `sessions.idle_timeout` / `retention` / `retain_transcript` | 30 min / 30 d / `duration` | |
+| `sessions.summary` / `summary_min_turns` / `resume_tail_turns` | `personal` / 3 / 6 | |
+| `sessions.token_at_rest` | `encrypted` (key from `secrets`) | or `never` (disables post-restart mining) |
+| `messages.queue` | `reject` | or `queue_one` |
+| `gate.content_deny_patterns` | `[]` | |
+| `assets.max_kb` / `inline_kb` / `ttl` | 10240 / 256 / 7 d | |
+| `events.flush_ms` / `max_events` / `max_age` / `stream_buffer_kb` / `persist_debug` | 50 / 5000 / 7 d / 512 / false | |
+| `api.heartbeat_s` / `token_warning_s` / `streaming` | 15 / 300 / `sse` | |
+| `audit.retention` | 90 d | audit store |
+| `notifier.adapter` | `none` | |
+
+## Startup validation
+
+The service refuses to start (exit with `config_invalid` and the list
+of problems) when:
+
+- a layer, step, adapter, runtime, or sandbox kind is not registered;
+- a template variable (`${team_id}`, `${user_root}`, `${workspace}`) is used where it cannot be resolved, or a user-layer path is not under `${user_root}`;
+- `tools.ceilings` lacks an entry for a configured layer, or grants a capability kind the layer may not have (server-side capabilities on `session`);
+- `required: true` is set on a gating step, or `locked: true` on a rule/fragment in a layer that may not lock (session; team unless the store allows it);
+- `risk_escalation` names an unknown layer or origin;
+- the global layer is missing, or any layer name is not one of the known set plus configured extras;
+- `users_root` is unset outside single-user mode;
+- a `required` source is unreachable at `prebuild` (global sources are prebuilt; others are checked lazily and reported).
+
+Warnings (start anyway, log once): a source with no writer behind a
+writable endpoint; a ceiling broader than the layer above it; a classifier
+deadline above 5 s; `tools.runtimes` empty while a skill store contains
+script tools.

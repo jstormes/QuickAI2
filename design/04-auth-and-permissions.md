@@ -63,6 +63,8 @@ as a policy baseline; only its skills, tools, and memories need a
 | `create-team-memory`      | write/update/delete memories in the user's teams' layers |
 | `run-server-tools`        | execute server-side tools at all (checked by the service scope gate before any rule) |
 | `run-high-risk-tools`     | execute tools whose *effective* risk is high (still subject to rules and audit) |
+| `read-audit`              | read audit records for the caller's own sessions               |
+| `read-audit-all`          | read audit records for any owner; freeze any session (an operator scope) |
 
 Notes on the starting set:
 
@@ -106,6 +108,25 @@ Pattern: `<verb>-<layer>-<resource>` with verbs `use`, `create`, and
 later maybe `manage`. Ten of the twelve starting permissions follow it;
 `run-server-tools` and `run-high-risk-tools` are execution gates rather
 than layer grants and use the `run-` verb deliberately.
+
+## Audit records
+
+Everything security-relevant is written to the audit store as one record
+shape, by `AuditLogListener` (events) and by direct `audit_log.write`
+calls in the classifier and runners:
+
+```
+AuditRecord {
+  id, ts, owner (sub), session_id?, turn_id?
+  kind:   tool_call | verdict | approval | memory | skill | chain | rule_change | source_write | refusal | freeze
+  ref:    { tool_call_id | approval_id | memory_id | skill_id | rule_id }
+  layer?: which layer's rule/step produced it
+  payload: kind-specific (verdict: source rule id or model, p_requested, decision, static trace;
+           memory: candidate hash, target layer, outcome; source_write: op, path/commit)
+}
+retention: config.audit.retention (default 90 d); records are append-only and never edited.
+read:      GET /audit (03-web-api.md) with read-audit (own) or read-audit-all
+```
 
 ## Where permissions are enforced
 

@@ -75,6 +75,10 @@ POST   /classifier/rules                  write a rule to a layer (needs create-
 DELETE /classifier/rules/{id}
 GET    /classifier/verdicts?session=...   audit log of verdicts (admin / own sessions)
 POST   /sources/refresh                   ask every layer handler's sources to reload
+POST   /sessions/{id}/assets              upload an attachment (owner-checked, size-capped) -> {asset_ref}
+POST   /sessions/{id}/freeze              freeze/unfreeze a session (owner, or read-audit-all holder); frozen sessions deny every message
+GET    /audit?session=&owner=&kind=&since=  audit records (own sessions with read-audit; any owner with read-audit-all)
+GET    /config/effective                  the validated, defaulted configuration (manage-sources)
 GET    /health
 ```
 
@@ -154,6 +158,34 @@ directions using the same event schema. Decision deferred; see IDEAS.md.
 | skill_forked         | out       | new skill id, from, by (service-level, not per session) |
 | error                | out       | code, message, recoverable                  |
 | context_exhausted    | out       | turn_id, tokens, window; session ends and a successor should be created with resume_from |
+| turn_denied          | out       | turn_id, reason (an on_message gate stopped the turn before the model) |
+| source_item_invalid  | out       | source, item id, reason (debug-level; a malformed skill/rule/fragment was skipped) |
+
+`turn_complete.outcome` is one of `ok | responded | denied | max_tokens |
+refusal | error | cancelled | exhausted`; `assistant_message` carries
+`truncated` or `refusal` when the outcome says so.
+
+## Error catalogue
+
+Used by the `error` event (`code`) and as HTTP error bodies (`{ error: code, ... }`).
+
+| Code                        | Where              | Meaning / client action                                            |
+|-----------------------------|--------------------|--------------------------------------------------------------------|
+| `not_owner`                 | HTTP 403           | token subject does not own the session/job/asset                   |
+| `scope_missing`             | HTTP 403           | token lacks the scope named in `scope`                             |
+| `turn_in_progress`          | HTTP 409           | a turn is running; cancel or wait for `turn_complete`              |
+| `context_exhausted`         | HTTP 409 / event   | conversation no longer fits; create a successor with `resume_with` |
+| `approval_conflict`         | HTTP 409           | approval already answered, expired, or unknown                     |
+| `no_pending_client_call`    | HTTP 409           | tool result for a call that is not awaiting the client             |
+| `exists` / `locked`         | HTTP 409           | skill/tool/fragment name taken, or base is locked (fork)           |
+| `invalid_args`              | tool result        | model's arguments failed schema validation                         |
+| `capability`                | tool result        | tool exceeds layer ceiling, path/host not permitted, builtin ref disallowed |
+| `timeout` / `rate_limited` / `cancelled` / `job_limit` | tool result | as named                                            |
+| `prompt_budget_exceeded`    | event + HTTP 500   | locked fragments alone exceed the model window; a misconfiguration |
+| `source_unavailable`        | event + HTTP 503   | a `required` source is down; turn failed                           |
+| `model_error`               | event              | provider returned a non-retryable error; turn failed               |
+| `model_unavailable`         | event              | provider unavailable after retries; turn failed                    |
+| `config_invalid`            | startup            | see the validation rules in `02-layering-and-composition.md`      |
 | turn_complete        | out       | turn_id, usage                              |
 
 ## Sessions
@@ -217,6 +249,8 @@ directions using the same event schema. Decision deferred; see IDEAS.md.
   | `GET /memories`                   | `use-{team,personal}-memory` (each filters its layer) |
   | `POST/DELETE /memories`           | `create-{team,personal}-memory` for the target layer |
   | `POST /sources/refresh`           | `manage-sources` (proposed)       |
+  | `GET /audit`                      | `read-audit` (own sessions) or `read-audit-all` |
+  | `POST /sessions/{id}/freeze`      | owner, or `read-audit-all`        |
   | `GET /health`                     | none                              |
 
 ## Tools executed by the client

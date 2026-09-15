@@ -66,8 +66,14 @@ TurnContext {
 }
 
 Step {
+  kind: gating | contributing                   # declared by the class; drives the default fail mode
   run(ctx, hook_payload) -> Continue | Stop(Action)
 }
+ContributingStep(Step) {                        # the common case
+  fetch(ctx, payload) -> result                 # I/O; may run concurrently across layers
+  apply(ctx, result)                            # pure; applied in chain order; uses ctx.put
+}
+# gating -> fail closed; contributing -> fail open; `required: true` on a contributing step fails the turn instead
 Layer {
   name: text
   hooks: {hook_name -> [Step]}                  # the inner chains
@@ -78,6 +84,7 @@ Layer {
 }
 
 Action = Deny(reason) | Respond(text) | RequireApproval(request)
+       | Accepted | Discarded                   # on_memory_candidate only: the candidate was consumed / dropped by this step
 ```
 
 The core's turn loop:

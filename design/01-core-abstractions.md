@@ -188,13 +188,18 @@ ToolDefinition {
   execute_on: enum               # server | client
   mode: enum                     # foreground | background | auto  (long-running tools: 08-walkthrough.md §13)
   on_session_end?: enum          # continue | cancel  (background only)
+  origin: { kind: source | skill | client, skill_name?, skill_layer? }   # where it came from; rules may match on it
+  requires: [Capability]         # declared needs; clipped to the layer ceiling into `granted` at registration
+  granted: [Capability]
+  effective_risk: enum           # risk after per-layer escalation (08-walkthrough.md §8c)
   implementation: ToolImpl       # see below
 }
 
 ToolImpl (one of)
   script   { runtime: text, entry: ResourceRef }   # e.g. a script in resources/
   http     { url, method, auth? }                   # call an external service
-  builtin  { ref: text }                            # provided by the host
+  builtin  { ref: text }                            # provided by the host; only allowed for origin.kind == source in a
+                                                    # layer listed in config.tools.builtin_refs_allowed_from (default [global])
   client   { }                                      # client-side; see web API
 
 SkillStore
@@ -433,7 +438,55 @@ ToolRunner.run(definition, args) -> result     # wrapped by decorators:
 - `ToolDefinition` is the type introduced in §3; skills and tool sources
   share it.
 
-## 8. Model client
+## 8. Write side of sources
+
+Every source kind has an optional writer port. A store without one is
+read-only through the API and is maintained outside the framework.
+
+```
+SkillWriter   { put(Skill) -> SkillId,  update(id, patch), delete(id) }
+ToolWriter    { put(ToolDefinition), update, delete }
+PromptWriter  { put(PromptFragment), update, delete }
+RuleWriter    { put(ClassifierRule), update, delete }
+MemoryWriter  { put(Memory), update, delete }             # §2
+```
+
+Git-backed writers: each write is one commit on the configured branch
+with author `<subject> via agent` and a message naming the API
+operation; `push` happens per write (default) or batched per
+`config.sources.git.push_interval_s`. A non-fast-forward on push is
+retried once after `fetch`; a merge conflict returns 409 `conflict` and
+leaves the working tree clean. Directory and file writers write
+atomically (temp file + rename). HTTP writers `PUT` and surface the
+service's status code.
+
+## 9. Asset store
+
+```
+AssetStore
+  put(owner, session_id, bytes, media_type, ttl) -> AssetRef    # ref = opaque 128-bit random id, never derived from content
+  get(ref, token) -> bytes | NotFound                          # owner must match token.subject; no listing across owners
+  delete(ref, token); sweep()                                  # TTL enforced by a sweeper
+```
+
+Used for truncated tool output (§12g of the walkthrough), attachments,
+and job results. Refs are meaningful only to their owner; a ref from
+another owner is `NotFound`, never `Forbidden`, so refs do not leak
+existence.
+
+## 10. Identifiers
+
+| Id            | Format                                              | Uniqueness                 |
+|---------------|-----------------------------------------------------|----------------------------|
+| session, turn, approval, job, asset, tool_call | opaque random (≥ 96 bits), prefixed `s_`, `t_`, `ap_`/`mc_`, `j_`, `a_`, `c_` | global |
+| MemoryId      | `<layer>/<store-local id>`; layer is `global`, `team:<team_id>`, `user`, `session` | per store; the layer prefix makes it global |
+| SkillId       | `<layer>:<name>` where `<layer>` is `global`, `team:<team_id>`, `personal`, `session`; `<name>` is `[a-z0-9-]+` | per layer |
+| tool name     | `<name>` from a tool source, `<skill>.<name>` from a skill, client tools as declared | per session accumulator |
+| fragment id, rule id | `[a-z0-9-]+`, unique within a source; the same id in two layers is an override | per layer |
+| team_id       | from the IdP; must not contain `:` or `/`           | per IdP                    |
+| subject       | the token's `sub`; used verbatim in `${user_root}` after path-safe encoding | per IdP |
+
+## 11. Model client
 
 ```
 ModelClient
