@@ -52,7 +52,7 @@ possibly owned and maintained by different people or systems.
   identity, model, and UI are adapters. The core has zero imports from any
   adapter.
 - **Composition over configuration.** Multiple providers of the same kind are
-  combined by the layer handler chain, which handles precedence, merging, and conflict
+  combined by the chain of layers and steps, which handles precedence, merging, and conflict
   rules. Adding a source should never require changing the core.
 - **Read paths and write paths are separate.** Most sources are read-only
   from the agent's point of view (e.g. a global skills repo). Only some

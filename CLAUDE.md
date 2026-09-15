@@ -25,7 +25,8 @@ git@github.com:jstormes/QuickAI2.git; commit design changes as you go.
 
 - `CLAUDE.md` – this file
 - `IDEAS.md` – running list of raw ideas and questions
-- `design/` – longer design notes on specific topics (start with `00-vision.md`;
+- `design/` – longer design notes on specific topics (start with `design/README.md`
+  for the reading order and flow index, and `design/GLOSSARY.md` for terms; then `00-vision.md`;
   `03-web-api.md` covers the streaming HTTP API all front ends use,
   `04-auth-and-permissions.md` covers OAuth2 login and permission scopes,
   `07-turn-pipeline.md` is the spine: the chain of layers, each running
