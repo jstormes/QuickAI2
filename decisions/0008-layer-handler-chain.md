@@ -1,9 +1,16 @@
 # 0008 – The turn is a chain of layer handlers over a shared turn context
 
-**Status:** accepted (2026-09-14). Supersedes the per-resource composite
-framing in the earlier drafts of `05-design-patterns.md`; does not change
-the substance of decisions 0005 (team layer), 0006 (skill overrides), or
-0007 (memory routing), which are restated as handler behaviour.
+**Status:** accepted (2026-09-14). **Refined by 0009**: hook points
+(`on_message`, `on_tool_call`, `on_memory_candidate`, `on_turn_end`)
+replace the inbound/outbound pair, and `Layer` + `InnerChain` + `Step`
+replace `LayerHandler`. The wording below is kept as the record of what
+was decided at the time; current vocabulary is in `07-turn-pipeline.md`
+and `GLOSSARY.md`.
+
+Supersedes the per-resource composite framing in the earlier drafts of
+`05-design-patterns.md`; does not change the substance of decisions 0005
+(team layer), 0006 (skill overrides), or 0007 (memory routing), which
+are restated as layer behaviour.
 
 ## Context
 
@@ -46,6 +53,8 @@ the chain with an action or enrich a context and pass it on.
   layer, preserving shadowing and locking.
 - Store interfaces (`SkillStore`, `MemoryStore`, ...) survive unchanged as
   the backends a handler delegates to.
-- Open: handler granularity (one class per layer vs. one per
-  layer-resource pair), error handling when a handler's backend is down,
-  and whether the session handler should be user-extensible.
+- Resolved since: granularity (one step per source, decision 0009);
+  backend-down handling (step kinds and fail modes,
+  `05-design-patterns.md` Decorator section, decision 0011); session
+  extensibility (declarative client gates only, `08-walkthrough.md`
+  §14c).

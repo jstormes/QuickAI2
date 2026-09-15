@@ -24,8 +24,10 @@ skill's declared capabilities.
 - Skills become mini-plugins; a skill store is effectively a plugin
   repository.
 - The service needs a capability enforcement point and, for script-based
-  implementations, some form of sandbox. Both are open design items.
+  implementations, a sandbox. Both are now specified: capability
+  ceilings and the restricted-subprocess sandbox in `08-walkthrough.md`
+  §12, recorded in decision 0011.
 - Tool risk can be raised by the runtime based on the skill's layer, since
-  global skills are lower trust than user-authored ones.
+  global skills come from less trusted maintainers than user-authored ones.
 - Clients may be asked to execute tools declared by skills; the API
   exposes the active tool list so clients can check what is expected.

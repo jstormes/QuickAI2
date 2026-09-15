@@ -28,7 +28,8 @@ git@github.com:jstormes/QuickAI2.git; commit design changes as you go.
 - `design/` – longer design notes on specific topics (start with `00-vision.md`;
   `03-web-api.md` covers the streaming HTTP API all front ends use,
   `04-auth-and-permissions.md` covers OAuth2 login and permission scopes,
-  `07-turn-pipeline.md` is the spine: the chain of layer handlers,
+  `07-turn-pipeline.md` is the spine: the chain of layers, each running
+  inner chains of steps at hook points,
   `05-design-patterns.md` names the patterns, `06-object-model.md` is the
   UML class model in Mermaid, `08-walkthrough.md` is pseudocode for
   every flow, `09-threat-model.md` names the trust boundaries)

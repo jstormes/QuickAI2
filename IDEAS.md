@@ -17,20 +17,18 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
   behind a streaming web API (`decisions/0001-streaming-web-api.md`).
   Remaining sub-question: should a pure in-process mode also be supported
   for tests and embedding, or is "run the service on localhost" enough?
-- **SSE vs. WebSocket.** SSE is simpler and enough for server-to-client
-  streaming with plain POSTs upstream. WebSocket allows true bidirectional
-  streaming (e.g. streaming tool results back). Could offer both over one
-  event schema.
+- ~~SSE vs. WebSocket.~~ Resolved: SSE plus POST is the default;
+  WebSocket is an optional transport adapter over the same event schema
+  (`08-walkthrough.md` §17e).
 - ~~API auth.~~ Decided: OAuth2-style login, permission scopes on the
   token (`decisions/0004-oauth2-scope-permissions.md`). Local mode uses a
   dev IdP rather than "no auth" so the code path is identical.
 - ~~Rename `Scope` to avoid clashing with OAuth2 scopes.~~ Superseded:
   the resolved context object was removed entirely; the validated
   `AccessToken` (sub, scopes, groups) is passed through instead.
-- **`token.allows(layer, verb, resource)` helper.** The scope-to-layer
-  table is small; a single helper on the token object keeps every
-  handler from re-implementing it. Where should it live so the token
-  type stays a plain claims holder?
+- ~~`token.allows(layer, verb, resource)` helper.~~ Resolved: it lives
+  on `AccessToken` with `allows_any` and `with_team` (`08-walkthrough.md`
+  §2); the token stays a claims holder plus these pure lookups.
 - ~~Permission naming pattern.~~ Done: `<verb>-<layer>-<resource>`;
   `allowed-personal-memory` split into `use-personal-memory` and
   `create-personal-memory`.
@@ -70,7 +68,8 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
 - ~~Sandboxing skill tools.~~ v1 decided in `08-walkthrough.md` §12d: a
   restricted subprocess (user/mount/network namespaces, read-only binds,
   egress proxy with host allowlist, rlimits, seccomp), mandatory for
-  script impls below the user layer; container and wasm as adapters.
+  every script impl (policy looser for the user layer); container and
+  wasm as adapters.
   Open: is the egress proxy acceptable operationally, or should team
   script tools be `http`-only in v1?
 - ~~Tool implementation portability.~~ Resolved: a config allowlist of
@@ -126,9 +125,9 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
 - **Locked fragment semantics with several teams.** If two of a user's
   teams both lock the same fragment id, which wins? Same peer-conflict
   problem as skills.
-- ~~Name the shape.~~ Resolved by `decisions/0008-layer-handler-chain.md`:
-  the layer is the handler; resources are accumulators on the turn
-  context. No generic `LayeredResource<T>` needed.
+- ~~Name the shape.~~ Resolved by `decisions/0008` and `0009`: a layer is
+  a chain of steps at hook points; resources are accumulators on the
+  turn context. No generic `LayeredResource<T>` needed.
 - ~~Handler granularity.~~ Resolved by `decisions/0009-chain-of-chains.md`:
   a layer is an inner chain of small steps per hook; one step per source.
 - ~~Step failure modes.~~ Resolved: `kind: gating | contributing` on
@@ -137,9 +136,9 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
 - ~~Client-supplied session steps.~~ Resolved in `08-walkthrough.md`
   §14c: clients register declarative *gates* (rules with fixed match
   fields, restrictive only, unlocked), never steps or code.
-- **Speculative audit cancellation.** If the model-based audit started on
-  partial arguments and the final arguments differ materially, restart or
-  accept? Proposal: hash the arguments; restart on change.
+- ~~Speculative audit cancellation.~~ Resolved: the audit cache key
+  includes the argument hash, so changed arguments re-run the audit
+  (`08-walkthrough.md` §3b, §8d).
 - **Inner-chain onion.** The inner chains are flat. If a step ever needs
   "before and after the rest of my layer" semantics, an onion-style inner
   chain could be allowed per layer without changing the outer chain.
@@ -151,32 +150,29 @@ Raw list. Promote items into `design/` when they mature; record outcomes in
   `execute_on: client`, and untrusted results. Open: should an
   authenticated *trusted app* client (its own OAuth client id) be allowed
   a lower escalation than an anonymous CLI?
-- **Rule expressiveness.** How rich should `ClassifierRule.match` be?
-  Options: fixed fields (tool name glob, risk, skill layer); a small
-  expression language; or "rules are just prompt fragments and the model
-  decides". Static fields first; expression language only if needed.
-- **Speculative audit.** Static rules are instant; the model handler is
-  not. Can the model-based audit run in parallel with the main model's
-  generation of the tool call arguments, and be cancelled if a static rule
-  decides first?
+- ~~Rule expressiveness.~~ Resolved for v1: fixed match fields, no
+  expression language (`08-walkthrough.md` §8a); revisit only if a real
+  rule cannot be expressed.
+- ~~Speculative audit.~~ Resolved: the model audit may start on the tool
+  name and partial arguments and is cancelled when a static rule decides
+  (`08-walkthrough.md` §3b, `07-turn-pipeline.md` execution model).
 - **Conflict between memories.** Two stores disagree (old preference vs.
   new). Timestamp wins? Layer wins? Surface both to the model?
 
 ## Ideas parking lot
 
-- Memory writes as a chain of responsibility: should a layer be able to
-  *claim* a candidate (e.g. team store says "this mentions our project,
-  I'll take it") or is routing purely by an explicit tag from the miner?
+- ~~Should a layer be able to *claim* a candidate?~~ Yes, by a widening
+  retag rule in that layer's `MiningRetagStep` (`08-walkthrough.md` §6d).
 - Should a store be able to declare it participates in the chain for
   some skill names only (prefix-based routing)?
 
 - Memory "decay" or confidence that lowers with age unless reinforced.
 - ~~Skills that bundle their own prompt fragments and tools (a skill as a
   mini-plugin).~~ Promoted to design; see `01-core-abstractions.md` §3.
-- An audit log of every classifier verdict for later tuning.
-- A `dry-run` mode where the classifier only logs what it would have
-  blocked, for calibration before enforcement.
-- Provenance on every context item so the model can cite "from your user
-  memory" vs. "from team policy".
+- ~~An audit log of every classifier verdict.~~ In the design: `08` §8g,
+  `04` audit records.
+- ~~A `dry-run` mode for the classifier.~~ In the design: `08` §8e.
+- ~~Provenance on every context item.~~ In the design: provenance
+  comments and memory citations (`08` §9f, §10e).
 - A reference implementation with only file-based adapters, to prove the
   interfaces before any database or service adapters exist.

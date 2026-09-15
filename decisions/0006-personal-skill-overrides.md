@@ -21,8 +21,9 @@ decision turns that into a supported workflow.
   fork restores the base.
 - A skill marked `locked` in a more trusted layer cannot be shadowed or
   forked.
-- The service tracks staleness (base version moved) and exposes a diff;
-  it does not auto-merge.
+- The service tracks staleness (base version moved) and exposes a
+  three-way diff and a user-initiated rebase (a server-side merge on
+  request; never automatic).
 
 ## Consequences
 

@@ -1,9 +1,9 @@
 # Object model (UML class diagrams)
 
 Mermaid `classDiagram` blocks; most Markdown viewers render them. Names
-match `01-core-abstractions.md` and `05-design-patterns.md`. Attributes and
-operations are the ones already sketched there; anything not shown is
-undecided, not omitted on purpose.
+match `01-core-abstractions.md`, `07-turn-pipeline.md`, and
+`08-walkthrough.md`. Where this note and the walkthrough differ, the
+walkthrough is authoritative and this note is kept in sync.
 
 Conventions: `<<interface>>` is a port the core depends on; concrete
 adapters are examples, not a fixed list. `*--` composition, `o--`
@@ -23,8 +23,9 @@ classDiagram
     }
     class Layer {
         +String name
-        +int precedence
-        +boolean writable
+        +int position
+        +Map~HookName,InnerChain~ hooks
+        +run(HookName, TurnContext, payload) Outcome
     }
     class TokenValidator {
         <<interface>>
@@ -160,6 +161,7 @@ classDiagram
     }
     class Layer {
         +String name
+        +int position
         +Map~HookName,InnerChain~ hooks
         +run(HookName, TurnContext, payload) Outcome
     }
@@ -176,7 +178,18 @@ classDiagram
     }
     class Step {
         <<interface>>
+        +StepKind kind
         +run(TurnContext, payload) Outcome
+    }
+    class StepKind {
+        <<enumeration>>
+        gating
+        contributing
+    }
+    class ContributingStep {
+        <<abstract>>
+        +fetch(TurnContext, payload) Object
+        +apply(TurnContext, Object)
     }
     class Outcome {
         <<abstract>>
@@ -231,7 +244,7 @@ classDiagram
     class DryRunStep
     class LayerFactory {
         +forEntry(LayerConfig, AccessToken) Layer
-        +chainFor(AccessToken) OuterChain
+        +chainFor(AccessToken, Session) OuterChain
     }
     class StepFactory {
         +register(stepName, ctor)
@@ -255,6 +268,10 @@ classDiagram
     Action <|-- Deny
     Action <|-- Respond
     Action <|-- RequireApproval
+    Action <|-- Accepted
+    Action <|-- Discarded
+    Step <|.. ContributingStep
+    Step ..> StepKind
     Step <|.. GateStep
     Step <|.. PromptFragmentsStep
     Step <|.. SkillDiscoveryStep
@@ -307,7 +324,7 @@ classDiagram
         +String instructions
         +Layer layer
         +SourceId source
-        +Capability[] permissions
+        +Capability[] capabilities
         +String[] triggers
         +String version
         +SkillRef derivedFrom
@@ -325,10 +342,16 @@ classDiagram
         +String name
         +String description
         +String[] toolNames
+        +Layer layer
+        +boolean locked
+        +String version
+        +SkillRef derivedFrom
+        +String[] triggers
+        +boolean auto
+        +boolean pinned
         +SkillId shadows
         +boolean stale
         +boolean suggested
-        +boolean pinned
         +boolean loaded
     }
     class LoadedSkill {
@@ -394,13 +417,17 @@ classDiagram
         <<interface>>
         +discover(query, AccessToken) SkillSummary[]
         +load(SkillId) Skill
-        +resources(SkillId) ResourceReader
+        +resource(SkillId, path) bytes
+        +loadVersion(SkillId, version) Skill
+        +has(name) boolean
+        +summary(SkillId) SkillSummary
+        +version(SkillId) String
     }
     class SkillWriter {
         <<interface>>
         +put(Skill) SkillId
+        +update(SkillId, patch)
         +delete(SkillId)
-        +fork(SkillId base, Layer target) SkillId
     }
     class ToolSource {
         <<interface>>
@@ -453,7 +480,7 @@ classDiagram
     }
     class Notifier {
         <<interface>>
-        +send(owner, Job)
+        +send(owner, kind, payload)
     }
 
     Skill "1" *-- "0..*" ToolDefinition
@@ -471,7 +498,7 @@ classDiagram
     ScriptImpl --> ResourceRef
     SkillStore ..> SkillSummary
     SkillStore ..> Skill
-    ToolSource ..> ToolAccumulator : handler puts into
+    ToolSource ..> ToolAccumulator : the layer's tools step puts into
     Skill ..> ToolAccumulator : loaded skill tools put at skill's layer
     ToolAccumulator ..> ToolDefinition
     ToolDispatcher --> ToolAccumulator : resolve
@@ -537,14 +564,12 @@ classDiagram
         +TurnId sourceTurn
         +String hash
     }
-    class MemoryRouter {
-        +route(MemoryCandidate, AccessToken, Session) Layer
-    }
     class MemoryStore {
         <<interface>>
         +search(query, AccessToken, opts) ScoredMemory[]
         +get(MemoryId) Memory
         +list(AccessToken, filter) Memory[]
+        +touch(MemoryId, usedAt)
     }
     class MemoryWriter {
         <<interface>>
@@ -562,9 +587,12 @@ classDiagram
     class ReciprocalRankFusion
     class LayerBoostedRank
     class CrossEncoderRerank
-    class MemoryWriteChain {
-        +offer(MemoryCandidate, AccessToken, Session) MemoryId
-        +promote(MemoryId, TeamId) MemoryId
+    class RouteToTeamStep {
+        +MemoryWriter store
+        +TeamId teamId
+    }
+    class RouteToPersonalStep {
+        +MemoryWriter store
     }
     class RecallPolicy {
         +select(ScoredMemory[], tokenBudget) Memory[]
@@ -579,9 +607,10 @@ classDiagram
     MergeStrategy <|.. ReciprocalRankFusion
     MergeStrategy <|.. LayerBoostedRank
     MergeStrategy <|.. CrossEncoderRerank
-    MemoryWriteChain *-- MemoryRouter
-    MemoryWriteChain o-- "1..*" MemoryWriter : team layers, then user
-    MemoryWriteChain ..> MemoryCandidate
+    RouteToTeamStep --> MemoryWriter : accept with positive signal
+    RouteToPersonalStep --> MemoryWriter : fallback
+    RouteToTeamStep ..> MemoryCandidate
+    RouteToPersonalStep ..> MemoryCandidate
     MemoryStore ..> ScoredMemory
     ScoredMemory --> Memory
     RecallPolicy *-- "1..*" RecallStep : pipeline
@@ -601,6 +630,7 @@ classDiagram
         +String body
         +boolean locked
         +boolean optional
+        +boolean shrinkable
         +Predicate condition
     }
     class PromptSource {
@@ -608,7 +638,7 @@ classDiagram
         +fragments(AccessToken, Session) PromptFragment[]
     }
     class PromptAssembler {
-        +assemble(AccessToken, Session) String
+        +assemble(TurnContext, budget) String
         +fragmentsUsed() PromptFragment[]
     }
     class RenderStrategy {
@@ -622,7 +652,7 @@ classDiagram
     }
 
     PromptAssembler ..> PromptFragment : from ctx.prompt
-    PromptSource ..> PromptFragment : handler puts into ctx.prompt
+    PromptSource ..> PromptFragment : the layer's prompts step puts into ctx.prompt
     Skill ..> PromptFragment : loaded skill contributes at its layer
     PromptAssembler *-- RenderStrategy
     PromptAssembler *-- "0..*" PromptBudgetStep : pipeline
@@ -636,8 +666,10 @@ classDiagram
 ```mermaid
 classDiagram
     class ClassifierEngine {
-        +audit(ToolCall, Conversation, AccessToken) Verdict
-        +mine(Turn, AccessToken) MemoryCandidate[]
+        <<interface>>
+        +audit(AuditInput) AuditOutput
+        +mine(turns, hints, instructions) MemoryCandidate[]
+        +summarise(Session) MemoryCandidate
     }
     class ClassifierRule {
         +String id
@@ -652,8 +684,12 @@ classDiagram
         <<interface>>
         +rules(AccessToken) ClassifierRule[]
     }
-    class ClassifierPolicy {
-        +rulesFor(Role, TurnContext) ClassifierRule[]
+    class StaticRulesStep {
+        +Layer layer
+    }
+    class ModelAuditStep {
+        +ClassifierEngine engine
+        +Thresholds thresholds
     }
     class RiskEscalationStep
     class ScopeGateStep
@@ -694,8 +730,12 @@ classDiagram
     class DryRunClassifier
     class AuditedClassifier
 
-    ClassifierEngine *-- ClassifierPolicy
     TurnContext ..> AuditState : per tool call
+    StaticRulesStep ..> ClassifierRule : reads this layer's rules from ctx.rules
+    ModelAuditStep --> ClassifierEngine
+    ModelAuditStep ..> Verdict : thresholds turn AuditOutput into a Verdict
+    Step <|.. StaticRulesStep
+    Step <|.. ModelAuditStep
     ClassifierEngine <|.. ModelEngine
     ClassifierEngine <|.. RulesOnlyEngine
     ClassifierEngine <|.. RemoteEngine
@@ -703,13 +743,12 @@ classDiagram
     ModelEngine ..> AuditOutput : structured output
     ClassifierEngine o-- "0..1" MemoryMiner
     ClassifierEngine --> PromptAssembler : own system prompt
-    ClassifierPolicy ..> ClassifierRuleSource : rules arrive via ctx.rules
+    ClassifierRuleSource ..> TurnContext : the layer's rules step appends to ctx.rules
     ClassifierRuleSource ..> ClassifierRule
     Step <|.. RiskEscalationStep
     Step <|.. ScopeGateStep
-    ClassifierEngine ..> Verdict
     ClassifierEngine ..> MemoryCandidate
-    MemoryMiner --> MemoryWriteChain : offers candidates
+    MemoryMiner ..> RouteToTeamStep : candidates walk on_memory_candidate
     ClassifierEngine <|-- ClassifierDecorator
     ClassifierDecorator o-- ClassifierEngine : wraps
     ClassifierDecorator <|-- DryRunClassifier
@@ -781,7 +820,7 @@ classDiagram
     ApiLayer o-- SessionStore
     TokenValidator <|.. OAuth2JwtValidator
     TokenValidator <|.. DevIdpValidator
-    AgentCore --> LayerFactory : chainFor(token)
+    AgentCore --> LayerFactory : chainFor(token, session)
     AgentCore --> OuterChain : on_message, on_tool_call, on_memory_candidate, on_turn_end
     AgentCore --> ModelClient : after on_message
     ModelClient ..> ModelRequest

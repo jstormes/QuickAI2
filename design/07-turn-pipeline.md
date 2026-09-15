@@ -2,7 +2,7 @@
 
 This note is the spine of the design. Everything layered (skills,
 memories, prompt fragments, classifier rules, tools) is delivered by the
-same mechanism: **an inbound message passes through the layers like
+same mechanism: **a user message passes through the layers like
 middleware; each layer exposes the same hook points, and at each hook it
 runs its own inner chain of steps.** Any step may stop the whole thing
 with an action or enrich a shared turn context and pass it on. See
@@ -21,10 +21,10 @@ client ──HTTP/SSE──▶ API ──▶ ┌────────── o
                              │          on_memory_candidate:[retag, accept/decline]   (restrictive mining rules run once, before routing)
                              │          on_turn_end:        [audit log]
                              └────────────────────────────────────────────────────────────┘
-                                          ▼ model call sits between on_message and the outbound hooks
+                                          ▼ model call sits between on_message and the later hooks
 ```
 
-**Outer chain.** The layers, in trust order. The inbound message is passed
+**Outer chain.** The layers, in trust order. The user message is passed
 through them like middleware. This is the only chain the core walks
 directly.
 
@@ -41,12 +41,12 @@ order):
 | Hook                  | When the core calls it                                  | Typical steps                                     |
 |-----------------------|---------------------------------------------------------|---------------------------------------------------|
 | `on_message`          | once, before the model runs                             | gates (rate limit, content policy), prompt fragments, skill discovery, tool definitions, memory search, rule loading |
-| `on_tool_call`        | once per tool call, as the model emits it               | static audit rules, capability check; the service appends the model-based auditor after the last layer |
-| `on_memory_candidate` | once per candidate, after the miner runs (off critical path) | mining rules, accept into this layer's store or decline |
+| `on_tool_call`        | once per tool call, as the model emits it               | static audit rules; the service prepends risk escalation and the scope gate and appends the model-based auditor after the last layer (capabilities are checked by the runner at execution) |
+| `on_memory_candidate` | once per candidate, after restrictive mining rules ran once (off critical path) | widening mining rules (retag), accept into this layer's store or decline |
 | `on_turn_end`         | once, after the final assistant message                 | audit log, metrics, post-hoc flags                 |
 
-There is no "outbound chain" as a return path. The last three hooks are
-the outbound side; they run in the same outer order as `on_message`.
+There is no return path. The last three hooks run after the model, in
+the same outer order as `on_message`.
 
 ```
 TurnContext {
@@ -59,7 +59,7 @@ TurnContext {
   tools:    {name -> ToolDefinition}            # locked names are final
   rules:    [ClassifierRule]                    # in layer order; each layer's step reads its own
   memories: [ScoredMemory]                      # from every layer, merged later
-  # outbound side:
+  # filled after the model call:
   model_output: AssistantMessage | ToolCall[]
   verdicts:  {tool_call_id -> Verdict}
   candidates: [MemoryCandidate]
@@ -92,7 +92,7 @@ The core's turn loop:
 ```
 run_turn(session, message):
   ctx = TurnContext(token, session, message)
-  layers = chain_for(token)                                  # outer chain
+  layers = chain_for(token, session)                         # outer chain
   if (r := run_hook("on_message", layers, ctx)) is Stop: return emit(r.action)
   loop:                                                      # agent loop, may iterate
       out = model.complete(render(ctx))                      # streams deltas to client
@@ -102,7 +102,7 @@ run_turn(session, message):
           else: execute(call)
       if out.is_final: break
   run_hook("on_turn_end", layers, ctx)
-  schedule_background: for c in miner.observe(ctx):
+  schedule_background: for c in classifier.mine([ctx.snapshot()], hints(ctx), instructions(ctx)):
                            run_hook("on_memory_candidate", layers, ctx, c)
 
 run_hook(name, layers, ctx, payload=None):
@@ -122,13 +122,13 @@ configured order within the layer. This single order serves both jobs
 the chain has:
 
 - **Gating** (stop the chain): the most trusted layer runs first, so
-  global policy can deny or demand approval before anyone lower gets a
-  say.
-- **Precedence** (who wins an override): later handlers overwrite earlier
+  global policy can deny or demand approval before any later layer gets
+  a say.
+- **Precedence** (who wins an override): later layers overwrite earlier
   values in the accumulators, so *last write wins* gives user precedence
   over team over global. That is the shadowing rule from
   `02-layering-and-composition.md` expressed as pipeline order.
-- **Locking**: an earlier handler marks a value `locked`; later handlers
+- **Locking**: an earlier layer marks a value `locked`; later layers
   may not overwrite it. A locked global skill, prompt fragment, or tool
   therefore survives a same-name user copy. For classifier rules,
   "locked" means a locked `allow` shields the call from later layers'
@@ -147,7 +147,7 @@ Two rules keep the chain honest:
 2. **Steps never talk to each other.** They communicate only through the
    context. A step may read what earlier layers or earlier steps
    contributed but holds no reference to other steps or layers.
-3. **The outbound hooks gate actions, never text.** Assistant text streams
+3. **The hooks after the model gate actions, never text.** Assistant text streams
    to the client at model speed and no step sees it before the client
    does. Text policy belongs in `on_message` (prompt fragments) or in
    `on_turn_end` (post-hoc flag events). A deployment that must filter
@@ -160,7 +160,7 @@ Steps are reusable classes configured with a source; the same
 `SkillDiscoveryStep` class serves global with a git store and user with a
 directory store. The standard set:
 
-| Resource         | `on_message` step                                                | outbound-hook step                                      |
+| Resource         | `on_message` step                                                | step in a later hook                                    |
 |------------------|------------------------------------------------------------------|---------------------------------------------------------|
 | Prompt fragments | put fragments into `ctx.prompt` by id; skip ids already locked   | –                                                       |
 | Skills           | put discovered skills into `ctx.skills` by name; skip locked     | –                                                       |
@@ -203,7 +203,7 @@ Notes:
 
 ## Merging the accumulators before the model call
 
-Handlers append; the core merges just before rendering:
+Steps append; the core merges just before rendering:
 
 - `ctx.prompt` → `PromptAssembler` groups by section, orders by priority,
   applies the token budget (drop `optional` first, never drop `locked`),
@@ -214,7 +214,7 @@ Handlers append; the core merges just before rendering:
   summaries of every skill plus every tool definition, already deduped by
   name through last-write-wins and locking.
 
-These merge steps are strategies, not handlers, because they have no
+These merge steps are strategies, not steps in a layer, because they have no
 layer: they operate on what all layers contributed.
 
 ## Execution model: chain order is merge order, not execution order
@@ -330,6 +330,6 @@ A solo deployment can list only `user` and `session`.
   with a different source, and a step is tested with a fake source and a
   hand-built context.
 - Gating and contribution share one ordering, so there is no separate
-  question of "which order do the composites consult layers in".
-- Testing a layer is instantiating one handler with fake sources and a
+  question of "which order are layers consulted in".
+- Testing a layer is instantiating it with fake sources and a
   hand-built context.

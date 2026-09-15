@@ -28,9 +28,13 @@ OAuth2 calls permissions "scopes". To avoid confusion with the framework's
 scope string such as `use-global-skill`; code calls the set `scopes`.
 
 There is no separate identity object. The validated **access token**
-(`sub`, `scope`, `groups` claims) is passed through the system as-is.
-Which layers a request touches is decided by looking at the token's
-scopes against the table below.
+(`sub`, `scope`, `groups` claims) is passed through the system as-is;
+the group claim name is configurable (`api.auth.groups_claim`, default
+`groups`). "Permission" always means an OAuth scope; a tool's or skill's
+declared needs are **capabilities** (`Skill.capabilities`,
+`ToolDefinition.requires`), never permissions. Which layers a request
+touches is decided by looking at the token's scopes against the
+scope-to-layer table.
 
 ### Scope-to-layer table
 
@@ -76,7 +80,7 @@ Notes on the starting set:
 - There is deliberately **no `create-global-memory`**. Memories are
   personal or team; a global memory store, if configured, is curated
   outside the agent (`decisions/0007-memory-routing.md`).
-- Team permissions apply to **every team in the token's `teams` claim**.
+- Team permissions apply to **every team in the token's `groups` claim**.
   Which teams that is comes from the IdP, not from the permission string.
   Finer grain (publish to team A but only use team B) is not supported in
   the starting set; see IDEAS.md.
@@ -105,9 +109,10 @@ Notes on the starting set:
 | `create-<layer>-tool`     | write tool definitions to that layer via the API         |
 
 Pattern: `<verb>-<layer>-<resource>` with verbs `use`, `create`, and
-later maybe `manage`. Ten of the twelve starting permissions follow it;
-`run-server-tools` and `run-high-risk-tools` are execution gates rather
-than layer grants and use the `run-` verb deliberately.
+later maybe `manage`. Ten of the fourteen starting permissions follow it;
+`run-server-tools` and `run-high-risk-tools` are execution gates and
+`read-audit` / `read-audit-all` are operator scopes, so they use the
+`run-` and `read-` verbs deliberately.
 
 ## Audit records
 
@@ -162,11 +167,17 @@ whatever the config maps `team_id = T` to, and members of T holding
 `create-team-skill` can write to it. Two teams can use completely
 different adapters (one a git repo, one an HTTP service).
 
+## Resolved elsewhere
+
+- Token refresh on long-lived sessions: any request may carry a newer
+  token from the same subject; the stream warns before expiry
+  (`08-walkthrough.md` §11d).
+- Identity for background work: mining runs as the user with the
+  session token, queued if the token is near expiry (`08` §6a);
+  `sessions.token_at_rest` decides whether it survives a restart.
+- Permission checks on memory search filter silently by excluding
+  layers; they never fail the request (`08` §10b).
+
 ## Open items
 
-- Token refresh on long-lived sessions (CLI left open overnight).
-- Service accounts for background jobs (memory mining runs *as* whom? The
-  session's subject, with a delegated/on-behalf-of token, seems right).
-- Whether permission checks on memory search should filter results or
-  fail the request. Proposal: filter silently by excluding layers.
 - Admin UI/CLI for assigning permissions lives in the IdP, not here.

@@ -47,13 +47,13 @@ backends a step reads from.
 
 There is no separate identity abstraction. The validated OAuth2 access
 token *is* the caller's identity, and it is passed to every store,
-handler, and policy that needs to know who is asking.
+step, and policy that needs to know who is asking.
 
 ```
 AccessToken {
   subject: text               # `sub` claim: the user or service account
   scopes: {text}              # `scope` claim: permissions, e.g. use-global-skill
-  groups: [text]              # `groups` (or `teams`) claim: team ids
+  groups: [text]              # `groups` claim: team ids (claim name configurable)
   expires_at, issuer, raw     # standard JWT fields, kept for refresh/audit
 }
 ```
@@ -85,9 +85,14 @@ Memory {
   tags: [text]
   links: [MemoryId]         # graph edges for "organized"
   layer: Layer              # which layer it belongs to
+  owner: PrincipalId        # the subject it was written for (user layer) or on behalf of (team layer)
+  confidence: float         # from the candidate; raised on reinforcement
   created_at, updated_at, used_at, source: SourceId
   pinned: bool              # always recalled; last to be dropped
+  supersedes?: MemoryId     # set when the miner said this replaces an earlier memory
   superseded_by?: MemoryId  # excluded from recall; kept for history
+  suggested_audience?: Audience   # a declined team suggestion, kept for promotion
+  promoted_from?: MemoryId  # set on the team copy made by promotion
   embedding?: vector        # optional, store-specific
 }
 
@@ -95,14 +100,15 @@ MemoryStore (read side)
   search(query, token, opts) -> [ScoredMemory]   # semantic + filter
   get(id) -> Memory
   list(token, filter) -> [Memory]
+  touch(id, used_at)                              # citation reinforcement
 
 MemoryWriter (write side, optional per store)
   put(memory) -> MemoryId
   update(id, patch)
   delete(id)
 
-Each layer's handler calls its own MemoryStore during the inbound chain and
-appends results to ctx.memories; a MergeStrategy fuses them afterwards.
+Each layer's MemorySearchStep calls its own MemoryStore during on_message
+and appends results to ctx.memories; a MergeStrategy fuses them afterwards.
 Writes go through the `on_memory_candidate` routing steps (below).
 ```
 
@@ -131,22 +137,17 @@ of view and curated by an admin outside the agent loop.
 
 ### Memory routing policy
 
-```
-route(candidate, token, session) -> Layer
-  if candidate.audience == team:T
-     and token.scopes has create-team-memory
-     and T in token.groups
-     and ( session.active_team == T
-           or team_rule(T).auto_accepts(candidate)
-           or user_confirms(candidate) ):
-        return team:T
-  if token.scopes has create-personal-memory:
-        tag candidate.suggested_audience = candidate.audience (if it was a team)
-        return personal
-  drop  # no writable layer; emit nothing
-```
+Routing is the `on_memory_candidate` hook: each team layer runs a
+`RouteToTeamStep`, the user layer runs `RouteToPersonalStep`, and the
+candidate walks them in chain order (`08-walkthrough.md` §6d). A team
+step accepts only if the token allows team writes for its team and a
+positive signal exists (the session's active team, an auto-accept rule
+of that team, or user confirmation) and the candidate's provenance does
+not include another team. The user step accepts anything the token
+allows and records a declined team suggestion. A candidate no step
+accepts is dropped.
 
-- **Private by default.** Personal is the fallback handler in the chain.
+- **Private by default.** The user step is the last, fallback step.
 - **`session.active_team`** is set by the client (CLI flag, web dropdown,
   app setting) and tells the router "team-relevant things go here". With
   no active team, everything is personal unless a team rule or the user
@@ -176,8 +177,14 @@ Skill {
   layer, source
   version: text                  # content hash or explicit version from the store
   derived_from?: SkillRef        # {id, layer, version} of the skill this was forked from
-  locked: bool                   # if true, lower-trust layers may not override it
-  permissions?: [Capability]     # what the skill may need (tools, network)
+  locked: bool                   # if true, later (less trusted) layers may not override it
+  auto, pinned: bool             # see §3 discovery
+  capabilities: [Capability]     # what the skill may need (tools, network); must cover its tools' `requires`
+}
+
+SkillSummary {                   # what discovery returns; cheap
+  id, name, description, tool_names: [text], layer, locked, version, derived_from?, triggers, auto, pinned
+  shadows?: SkillId, stale?: bool, suggested: bool, loaded: bool     # filled per turn
 }
 
 ToolDefinition {
@@ -205,11 +212,17 @@ ToolImpl (one of)
 SkillStore
   discover(query, token) -> [SkillSummary]   # cheap; store-side index over name+description+triggers
   load(id) -> Skill                          # full body; version-pinned per session once loaded
-  resource(id, path) -> bytes                # size-capped
+  resource(id, path) -> bytes                # size-capped; path confined to the skill folder
   load_version(id, version) -> Skill?        # optional; git stores can
+  has(name) -> bool
+  summary(id) -> SkillSummary
+  version(id) -> text
 
-Each layer's handler calls its own SkillStore during the inbound chain and
-puts summaries into ctx.skills by name; later layers overwrite unlocked
+SkillWriter (optional per store)
+  put(Skill) -> SkillId, update(id, patch), delete(id)     # forking is API-layer logic on top of put
+
+Each layer's SkillDiscoveryStep calls its own SkillStore during on_message
+and puts summaries into ctx.skills by name; later layers overwrite unlocked
 names (shadowing), locked names are final.
 ```
 
@@ -229,15 +242,15 @@ workflow (`decisions/0006-personal-skill-overrides.md`).
 
 - **Fork, not patch.** The override is a full copy of the skill placed in
   the user's layer under the *same name*, with `derived_from` recording
-  the base skill's id, layer, and version. Because same-name-higher-layer
-  wins, the copy shadows the base everywhere: discovery, load, its tools,
+  the base skill's id, layer, and version. Because the same name in a
+  later layer wins, the copy shadows the base everywhere: discovery, load, its tools,
   and its prompt fragments. The base remains loadable by full id.
 - **Permissions.** Forking needs `use-<base layer>-skill` to read the base
   and `create-personal-skill` to write the copy. A team override
-  (`create-team-skill`) works the same way one layer down.
+  (`create-team-skill`) works the same way one layer earlier.
 - **Locked skills cannot be overridden.** A global skill with
-  `locked: true` is excluded from shadowing: a same-name skill in a lower
-  trust layer is ignored with a warning, and the fork endpoint refuses.
+  `locked: true` is excluded from shadowing: a same-name skill in a later,
+  less trusted layer is ignored with a warning, and the fork endpoint refuses.
   This is how policy-bearing skills stay authoritative.
 - **Staleness.** When the base skill's version changes, the fork's
   `derived_from.version` no longer matches. Discovery marks the fork
@@ -257,7 +270,7 @@ A skill is a **mini-plugin**: instructions plus, optionally, the tools
 those instructions rely on and prompt fragments to accompany them.
 
 - **Registration.** When a skill is loaded into a session, its tools
-  are put into `ctx.tools` (§7) by the handler of the skill's layer under a
+  are put into `ctx.tools` (§7) by the skill's own layer under a
   namespaced name (`<skill>.<tool>`) and are included in the tool
   definitions sent to the model. When the skill is unloaded, the tools go
   away. Tools are therefore per-session in visibility even though the
@@ -270,18 +283,18 @@ those instructions rely on and prompt fragments to accompany them.
   with `execute_on: client`.
 - **Classifier audit.** Skill-defined tools go through the same tool-call
   audit as built-in tools. The declared `risk` feeds the approval policy.
-  Because skills can come from lower-trust layers (a global repo maintained
+  Because skills can come from less trusted maintainers (a global repo maintained
   by someone else), the runtime may raise the effective risk of a tool
   based on its skill's layer.
-- **Capabilities.** A skill's `permissions` must cover what its tools need
+- **Capabilities.** A skill's `capabilities` must cover what its tools need
   (network, filesystem, subprocess). The service enforces this at the
   `ToolImpl` boundary. A skill store, or the service config, can restrict
   which capabilities a layer is allowed to grant.
 - **Name collisions.** Because tool names are namespaced by skill, two
-  skills may both define `search`. Shadowing rules for skills (higher
-  layer wins on same skill name) apply to the whole skill, tools included.
-- **Discovery stays cheap.** `SkillSummary` lists tool names only; full
-  schemas are loaded with the skill body.
+  skills may both define `search`. Shadowing rules for skills (the later
+  layer wins on the same skill name) apply to the whole skill, tools included.
+- **Discovery stays cheap.** `SkillSummary` carries tool names and flags
+  only; full schemas and instructions are loaded with the skill body.
 
 ## 4. System prompt sources
 
@@ -289,9 +302,9 @@ those instructions rely on and prompt fragments to accompany them.
 PromptFragment {
   id, source, layer
   priority: int
-  section: enum   # identity | policy | project | user_prefs | session | tools
+  section: enum   # identity | policy | project | skills | tools | user_prefs | memories | session
   body: text
-  locked: bool    # lower (more trusted) layer wins for this id if true
+  locked: bool    # the earlier (more trusted) layer wins for this id if true
   optional: bool  # may be dropped first under token budget
   shrinkable: bool # assembler may render a smaller version before dropping (derived fragments)
   condition?: predicate over (token, session)   # fixed fields: active_team, client_kind, groups, scopes, time window
@@ -299,17 +312,18 @@ PromptFragment {
 
 PromptSource.fragments(token, session) -> [PromptFragment]
 
-PromptAssembler (merge step, after the inbound chain)
-  assemble(ctx.prompt) -> ordered text grouped by section, budgeted, rendered
+PromptAssembler (merge step, after on_message)
+  assemble(ctx, budget) -> ordered text grouped by section, budgeted, rendered
 ```
 
-- Each layer's handler contributes fragments to `ctx.prompt` during the
-  inbound chain (`07-turn-pipeline.md`); `PromptAssembler` is the merge
-  step that runs afterwards.
-- Every layer contributes fragments. A fragment id supplied by a higher
-  layer overrides the same id from a lower layer, unless the lower one is
-  `locked`, in which case the lower (more trusted) layer wins. Distinct
-  ids accumulate. Output is grouped by section and ordered by priority.
+- Each layer's PromptFragmentsStep contributes fragments to `ctx.prompt`
+  during on_message (`07-turn-pipeline.md`); `PromptAssembler` is the
+  merge step that runs afterwards.
+- Every layer contributes fragments. A fragment id supplied by a later
+  layer overrides the same id from an earlier layer, unless the earlier one
+  is `locked`, in which case the earlier (more trusted) layer wins. Distinct
+  ids accumulate. Output is grouped by section; within a section, priority
+  descending, then the earlier layer first, then id.
 - Skills may contribute fragments while loaded (`Skill.prompt_fragments`).
 - Rendering (plain text vs. tagged sections) is a strategy chosen per
   deployment or model.
@@ -323,8 +337,8 @@ The core does not expose a UI. It exposes a **web API with streaming**
 (details in `03-web-api.md`), and every front end is a client of it.
 
 ```
-Inbound  (client -> API) : user_message, tool_result, approval_response, cancel
-Outbound (API -> client) : assistant_delta, assistant_message,
+Client -> API : user_message, tool_result, approval_response, cancel
+API -> client : assistant_delta, assistant_message,
                            tool_call_proposed, approval_requested,
                            memory_created, error, turn_complete
 ```
@@ -355,14 +369,17 @@ verdict log span all sessions for calibration.
 ### Role A: tool-call audit
 
 ```
-ToolCallAudit.review(conversation_window, proposed_tool_call)
-  -> { verdict: allow | deny | ask_user, confidence, reason }
+ClassifierEngine.audit(AuditInput) -> AuditOutput
+  AuditInput  = { window, call, definition, provenance, prior_calls, instructions }
+  AuditOutput = { p_requested, effect_summary, reason, mismatch? }
 ```
 
-- Runs between "model proposed a tool call" and "tool executes".
-- Inputs: the recent user messages, the proposed call, and the tool's
-  declared risk level. Output feeds an `ApprovalPolicy` that decides
-  whether to execute, block, or emit `approval_requested` to the front end.
+- Runs between "model proposed a tool call" and "tool executes", as the
+  last `on_tool_call` step; the step applies the configured thresholds to
+  turn `p_requested` into a Verdict (allow / deny / ask_user) and then
+  executes, denies, or emits `approval_requested`.
+- Inputs: the recent conversation window, the proposed call, its
+  definition and provenance, and the layered instruction fragments.
 - Must be cheap and fast; it sits on the critical path. Layered static
   rules run first and can decide without a model call; a deployment may
   run rules-only.
@@ -370,11 +387,15 @@ ToolCallAudit.review(conversation_window, proposed_tool_call)
 ### Role B: background memory generation
 
 ```
-MemoryMiner.observe(turn, session) -> [MemoryCandidate]
+ClassifierEngine.mine(turns, hints, instructions) -> [MemoryCandidate]
+ClassifierEngine.summarise(session) -> MemoryCandidate        # kind=episodic, at session end
 
 MemoryCandidate {
-  kind, body, rationale, confidence
+  kind, body, rationale, confidence, tags, links
   audience: personal | team:<id>     # the miner's *suggestion*, not a decision
+  supersedes?: [MemoryId]            # only the miner may declare a contradiction
+  provenance: { teams: [team_id] }   # which teams' skills/memories the turn drew on
+  hash, source_turn                  # idempotency and attribution
 }
 ```
 
@@ -385,7 +406,7 @@ MemoryCandidate {
   loaded this turn, which recalled memories came from a team layer, and
   explicit mentions in the conversation.
 - **The miner never picks a store.** Candidates go through the layered
-  mining rules and then the memory routing policy (§2), which decides the
+  mining rules and then the routing steps (§2), which decide the
   layer with personal as the fallback. Private by default: a wrong guess
   can only keep something personal, never leak it to a team.
 - Emits `memory_created` events (with the layer chosen) so the front end
@@ -420,7 +441,7 @@ Tools follow the same layered pattern as everything else
 ToolSource.tools(token) -> [ToolDefinition]      # one per layer
 
 ctx.tools (accumulator on the TurnContext)
-  filled by each layer's handler from its ToolSource plus tools of skills
+  filled by each layer's ToolDefinitionsStep from its ToolSource plus tools of skills
   loaded at that layer; later layers overwrite unlocked names, locked
   names are final. What the model sees is ctx.tools after the chain.
 
@@ -431,8 +452,8 @@ ToolRunner.run(definition, args) -> result     # wrapped by decorators:
 ```
 
 - Built-in tools are simply the global layer's tool source.
-- A layer may lock a tool definition so lower-trust layers cannot shadow
-  it.
+- A layer may lock a tool definition so later, less trusted layers cannot
+  shadow it.
 - A client may contribute a session-layer tool source at session creation
   (tools it can execute locally).
 - `ToolDefinition` is the type introduced in §3; skills and tool sources

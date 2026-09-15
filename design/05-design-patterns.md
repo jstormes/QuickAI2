@@ -35,7 +35,7 @@ step.run(ctx, payload) -> Continue | Stop(Action)
 
 Where one answer must win (loading a skill by name, resolving a tool by
 name) the chain's last-write-wins on a keyed accumulator *is* the
-resolution; no separate resolver is needed. Where every layer contributes
+resolution; nothing else resolves it. Where every layer contributes
 (memories, prompt fragments, rules) the accumulator collects everything
 and a merge strategy runs afterwards.
 
@@ -46,11 +46,12 @@ Two inner chains deserve naming because their steps make decisions:
   accumulate across layers; `allow` pre-empts the model audit but yields
   to any restriction unless locked, in which case it shields the call
   from later layers. The model-based auditor is the last step.
-- **Memory write routing**: a candidate is offered to team handlers
-  (accept only with a positive signal: active team, auto-accept rule,
-  user confirmation), then to the user handler (accepts anything the
-  token allows, recording any declined team suggestion for promotion).
-  Global never accepts agent-driven writes.
+- **Memory write routing**: a candidate is offered to each team layer's
+  `RouteToTeamStep` (accepts only with a positive signal: active team,
+  auto-accept rule, user confirmation, and no other team in the
+  candidate's provenance), then to the user layer's `RouteToPersonalStep`
+  (accepts anything the token allows, recording any declined team
+  suggestion for promotion). Global has no accepting step.
 
 ## Factory: building layers, steps, and sources
 
@@ -77,7 +78,7 @@ ClassifierEngineFactory.create(config) -> ClassifierEngine
 
 ## Decorator: cross-cutting behaviour
 
-On sources (inside a handler):
+On sources (inside a step):
 
 - `CachingSource(ttl)` for remote adapters.
 - `PermissionFilteredSource(required_scope)` returns nothing when the
@@ -98,12 +99,12 @@ On steps:
 On tool runners: `SandboxedRunner`, `CapabilityCheckedRunner`,
 `TimeoutRunner`, `RateLimitedRunner`, `AuditedRunner`. On the classifier
 engine: `DryRunClassifier`, `AuditedClassifier`. Wrap order is set by
-the factory and can be mandatory for lower-trust layers.
+the factory and can be mandatory for less trusted layers.
 
 ## Strategy: the merge steps
 
-Merge steps run after the inbound chain, on what every layer contributed.
-They have no layer, so they are strategies rather than handlers.
+Merge steps run after `on_message`, on what every layer contributed.
+They have no layer, so they are strategies rather than steps.
 
 - `MergeStrategy` for `ctx.memories`: reciprocal rank fusion (default),
   layer-boosted rank, cross-encoder rerank.
@@ -126,7 +127,7 @@ Small ordered steps applied to a list, each pluggable:
 
 ## Observer: the event stream
 
-Handlers, the classifier, and tool runners publish events on the
+Steps, the classifier, and tool runners publish events on the
 session's bus (`memory_created`, `skill_loaded`, `skill_shadowed`,
 `tool_call_proposed`, `approval_requested`, `memory_confirm`). The API
 layer forwards them to the one owning client; internal listeners

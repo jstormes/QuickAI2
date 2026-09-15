@@ -21,7 +21,7 @@ teaching storage adapters anything about auth.
   (The last two were originally one permission, `allowed-personal-memory`,
   split so recall and learning can be granted separately.)
 - The validated access token object (`sub`, `scopes`, `groups`) is passed
-  through to layer handlers and their stores, which filter by it directly. There is
+  through to the layers' steps and their stores, which filter by it directly. There is
   no intermediate identity or context object.
 
 ## Consequences
