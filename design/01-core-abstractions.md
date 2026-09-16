@@ -35,7 +35,7 @@ backends a step reads from.
                 |  ClassifierRuleSource · ToolSource          |
                 +----------------------+----------------------+
                                        |
-                    adapters: git · directory · sqlite_vec · http · file · builtin
+                    adapters: git · directory · sqlite_vec · http · file · inline · builtin
                                    +---------------------------+
                                    |  Support: ClassifierAgent |
                                    |  · tool-call audit        |
@@ -93,14 +93,19 @@ Memory {
   superseded_by?: MemoryId  # excluded from recall; kept for history
   suggested_audience?: Audience   # a declined team suggestion, kept for promotion
   promoted_from?: MemoryId  # set on the team copy made by promotion
+  hash: text                # sha256(normalise(body)); put() is idempotent on it within mining.dedupe_window
   embedding?: vector        # optional, store-specific
 }
+# normalise(body) = NFC, lowercase, collapse whitespace, strip trailing punctuation
 
 MemoryStore (read side)
   search(query, token, opts) -> [ScoredMemory]   # semantic + filter
-  get(id) -> Memory
+  get(id, token) -> Memory | NotFound
   list(token, filter) -> [Memory]
-  touch(id, used_at)                              # citation reinforcement
+  touch(id, token, used_at)                       # citation reinforcement
+  # membership rule for get/touch/expand_links: the id's layer prefix must be a layer in the
+  # caller's chain: `global` always; `team:T` needs T in token.groups and use-team-memory;
+  # `user` needs memory.owner == token.subject. Anything else is NotFound, never Forbidden.
 
 MemoryWriter (write side, optional per store)
   put(memory) -> MemoryId
@@ -108,7 +113,7 @@ MemoryWriter (write side, optional per store)
   delete(id)
 
 Each layer's MemorySearchStep calls its own MemoryStore during on_message
-and appends results to ctx.memories; a MergeStrategy fuses them afterwards.
+and appends results to ctx.memories; the MemoryMerge strategy fuses them afterwards.
 Writes go through the `on_memory_candidate` routing steps (below).
 ```
 
@@ -122,7 +127,7 @@ Key decisions to keep the storage loosely coupled:
   directory structure. A file-based store may map these to folders, but that
   is an adapter detail.
 - **Recall is a pipeline stage**, not a store feature: each layer's
-  `MemorySearchStep` fills `ctx.memories`, `MemoryMergeStep` fuses by
+  `MemorySearchStep` fills `ctx.memories`, the `MemoryMerge` strategy fuses by
   rank (RRF) and dedupes across layers, then `RecallPolicy` decides how
   many and which go into the context window. Full flow in
   `08-walkthrough.md` §10.
@@ -178,7 +183,6 @@ Skill {
   version: text                  # content hash or explicit version from the store
   derived_from?: SkillRef        # {id, layer, version} of the skill this was forked from
   locked: bool                   # if true, later (less trusted) layers may not override it
-  auto, pinned: bool             # see §3 discovery
   capabilities: [Capability]     # what the skill may need (tools, network); must cover its tools' `requires`
 }
 
@@ -190,7 +194,8 @@ SkillSummary {                   # what discovery returns; cheap
 ToolDefinition {
   name: text                     # namespaced on registration: <skill>.<name>
   description: text
-  input_schema: JSONSchema
+  input_schema: JSONSchema       # properties may carry `x-arg-kind: path | host | url`; only annotated args are
+                                 # path/host-checked at run time (08-walkthrough.md §12e); no heuristics
   risk: enum                     # none | low | medium | high
   execute_on: enum               # server | client
   mode: enum                     # foreground | background | auto  (long-running tools: 08-walkthrough.md §13)
@@ -283,9 +288,10 @@ those instructions rely on and prompt fragments to accompany them.
   with `execute_on: client`.
 - **Classifier audit.** Skill-defined tools go through the same tool-call
   audit as built-in tools. The declared `risk` feeds the approval policy.
-  Because skills can come from less trusted maintainers (a global repo maintained
-  by someone else), the runtime may raise the effective risk of a tool
-  based on its skill's layer.
+  Because a skill-shipped tool is less reviewed than the builtin tool
+  source (even in the global layer, which is the most trusted layer), the
+  runtime raises the effective risk of a tool based on its origin and
+  layer (`tools.risk_escalation`, keys `origin:skill`, `layer:team`, ...).
 - **Capabilities.** A skill's `capabilities` must cover what its tools need
   (network, filesystem, subprocess). The service enforces this at the
   `ToolImpl` boundary. A skill store, or the service config, can restrict
@@ -312,19 +318,26 @@ PromptFragment {
 
 PromptSource.fragments(token, session) -> [PromptFragment]
 
-PromptAssembler (merge step, after on_message)
-  assemble(ctx, budget) -> ordered text grouped by section, budgeted, rendered
+PromptAssembler (a merge strategy invoked by the core after on_message)
+  assemble(ctx, budget) -> AssembledPrompt   # { text, fragments_used, hash }; grouped by section, budgeted, rendered
 ```
 
 - Each layer's PromptFragmentsStep contributes fragments to `ctx.prompt`
   during on_message (`07-turn-pipeline.md`); `PromptAssembler` is the
-  merge step that runs afterwards.
+  merge strategy the core runs afterwards.
+- A layer may only contribute to the sections in its
+  `layers[].allowed_sections` (defaults: global all; team `project,
+  skills, tools`; user `project, user_prefs`; session `session`). A
+  fragment in a disallowed section is dropped at `put` with
+  `shadow_refused(reason=section)`. `identity` and `policy` are therefore
+  global-only.
 - Every layer contributes fragments. A fragment id supplied by a later
   layer overrides the same id from an earlier layer, unless the earlier one
   is `locked`, in which case the earlier (more trusted) layer wins. Distinct
   ids accumulate. Output is grouped by section; within a section, priority
   descending, then the earlier layer first, then id.
-- Skills may contribute fragments while loaded (`Skill.prompt_fragments`).
+- Skills may contribute fragments while loaded (`Skill.prompt_fragments`),
+  restricted to the `project` and `skills` sections regardless of layer.
 - Rendering (plain text vs. tagged sections) is a strategy chosen per
   deployment or model.
 - Recalled memories and the skill index enter as *derived* fragments
@@ -392,7 +405,7 @@ ClassifierEngine.summarise(session) -> MemoryCandidate        # kind=episodic, a
 
 MemoryCandidate {
   kind, body, rationale, confidence, tags, links
-  audience: personal | team:<id>     # the miner's *suggestion*, not a decision
+  audience: personal | team:<id> | session   # the miner's *suggestion*, not a decision; `session` only for kind=scratch
   supersedes?: [MemoryId]            # only the miner may declare a contradiction
   provenance: { teams: [team_id] }   # which teams' skills/memories the turn drew on
   hash, source_turn                  # idempotency and attribution
@@ -421,10 +434,21 @@ following the same layered pattern as skills, memories, and prompts
 order: `deny` and `require_approval` accumulate across layers, an
 `allow` pre-empts the model audit but yields to any restriction unless
 it is locked, and the model-based judgment is the final step
-(`08-walkthrough.md` §8b). Memory-mining policy is a
-pipeline of layered rules applied to the miner's candidates before they
-reach the memory write chain. The classifier's own system prompt is
-assembled by the same `PromptAssembler` as the agent's.
+(`08-walkthrough.md` §8b). A locked `allow` shields the call from later
+layers; calls at or above `classifier.always_audit_risk_gte` are
+model-audited even when an unlocked `allow` matched. Restrictive
+memory-mining and memory-recall rules from every layer are applied in
+layer order (`locked` is not special for them) before routing. The
+classifier's own system prompt is assembled by the same `PromptAssembler`
+as the agent's.
+
+```
+ClassifierRule.role: tool_audit | memory_mining | memory_recall
+Match (tool_audit):     tool | tool_in | tool_glob | tool_layer | tool_layer_in | origin | origin_in
+                        | risk_gte | effective_risk_gte | execute_on | args_match | skill
+Match (memory_mining):  kind | kind_in | audience | body_matches (regex) | confidence_lt | tags_any | source_turn_has_team
+Match (memory_recall):  kind_in | tags_any | layer
+```
 
 ### Why one "classifier" for both roles
 
@@ -451,7 +475,10 @@ ToolRunner.run(definition, args) -> result     # wrapped by decorators:
                                                # timeout, rate limit, audit
 ```
 
-- Built-in tools are simply the global layer's tool source.
+- Built-in tools are simply the global layer's tool source. The builtin
+  `load_skill(name_or_id)` resolves a bare name via `ctx.skills` and a
+  full `layer:name` id directly against that layer's store (still
+  audited).
 - A layer may lock a tool definition so later, less trusted layers cannot
   shadow it.
 - A client may contribute a session-layer tool source at session creation
@@ -495,17 +522,33 @@ and job results. Refs are meaningful only to their owner; a ref from
 another owner is `NotFound`, never `Forbidden`, so refs do not leak
 existence.
 
+## 9a. Audit store and secrets provider
+
+```
+AuditStore
+  write(AuditRecord)                       # the ONLY write path; steps, runners, and the classifier call audit.write(...)
+  query(filter, token) -> [AuditRecord]    # own sessions with read-audit; any owner with read-audit-all
+  retention: config.audit.retention        # append-only; never edited
+# AuditRecord shape: 04-auth-and-permissions.md "Audit records". The on_turn_end persistence
+# is the service's AuditLogListener; there is no configurable audit_log step.
+
+SecretsProvider                            # adapter: env | file | vault (config.secrets.*)
+  get(name) -> value                       # called only inside runners / the egress proxy; never from ctx
+  redaction_patterns() -> [pattern]        # registered at load; raw values are never enumerated
+```
+
 ## 10. Identifiers
 
 | Id            | Format                                              | Uniqueness                 |
 |---------------|-----------------------------------------------------|----------------------------|
 | session, turn, approval, job, asset, tool_call | opaque random (≥ 96 bits), prefixed `s_`, `t_`, `ap_`/`mc_`, `j_`, `a_`, `c_` | global |
-| MemoryId      | `<layer>/<store-local id>`; layer is `global`, `team:<team_id>`, `user`, `session` | per store; the layer prefix makes it global |
-| SkillId       | `<layer>:<name>` where `<layer>` is `global`, `team:<team_id>`, `personal`, `session`; `<name>` is `[a-z0-9-]+` | per layer |
+| MemoryId      | `<layer>/<store-local id>`; layer is `global`, `team:<team_id>`, `user`, `session`; the citation marker is `[m:<MemoryId>]`, e.g. `[m:team:team-a/17]` | per store; the layer prefix makes it global |
+| skill version | `content_hash(skill)` = sha256 of canonical JSON (sorted keys) of the skill without `version`; git stores may use the folder tree hash instead | per skill |
+| SkillId       | `<layer>:<name>` where `<layer>` is `global`, `team:<team_id>`, `user`, `session`; `<name>` is `[a-z0-9-]+` | per layer |
 | tool name     | `<name>` from a tool source, `<skill>.<name>` from a skill, client tools as declared | per session accumulator |
 | fragment id, rule id | `[a-z0-9-]+`, unique within a source; the same id in two layers is an override | per layer |
 | team_id       | from the IdP; must not contain `:` or `/`           | per IdP                    |
-| subject       | the token's `sub`; used verbatim in `${user_root}` after path-safe encoding | per IdP |
+| subject       | the token's `sub`; in `${user_root}` after path-safe encoding: percent-encode every byte outside `[A-Za-z0-9._-]` (injective); if longer than 255 bytes, use its sha256 hex | per IdP |
 
 ## 11. Model client
 

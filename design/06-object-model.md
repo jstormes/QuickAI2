@@ -19,11 +19,16 @@ classDiagram
         +String[] groups
         +String issuer
         +Instant expiresAt
+        +String raw
         +allows(Layer, verb, resource) boolean
+        +allowsAny(Layer) boolean
+        +withTeam(TeamId) AccessToken
     }
     class Layer {
         +String name
         +int position
+        +Section[] allowedSections
+        +boolean mayLock
         +Map~HookName,InnerChain~ hooks
         +run(HookName, TurnContext, payload) Outcome
     }
@@ -40,6 +45,7 @@ classDiagram
         +AccessToken token
         +SessionState state
         +TurnState turn
+        +SessionStateEnum stateValues
         +TeamId activeTeam
         +String clientKind
         +ToolDefinition[] clientTools
@@ -55,6 +61,14 @@ classDiagram
         +boolean frozen
         +createdAt
         +lastSeenAt
+    }
+    class SessionStateEnum {
+        <<enumeration>>
+        created
+        active
+        idle
+        exhausted
+        ended
     }
     class Conversation {
         +Message[] messages
@@ -84,6 +98,30 @@ classDiagram
     class AuditLogListener
     class MetricsListener
     class NotifierListener
+    class WebhookListener
+    class DeltaCoalescer {
+        +flushMs int
+        +onDelta(text)
+        +flush()
+    }
+    class ServiceBus {
+        +publishToOwner(owner, type, payload)
+    }
+    class ApprovalStore {
+        <<interface>>
+        +save(ApprovalRequest)
+        +get(approvalId) ApprovalRequest
+        +pending(owner, kind) ApprovalRequest[]
+        +answer(approvalId, Decision)
+    }
+    class Decision {
+        +String decision
+        +String remember
+        +String rememberMatch
+        +String note
+        +PrincipalId by
+        +Instant at
+    }
     class Event {
         +int v
         +int seq
@@ -110,6 +148,11 @@ classDiagram
     Listener <|.. AuditLogListener
     Listener <|.. MetricsListener
     Listener <|.. NotifierListener
+    Listener <|.. WebhookListener
+    EventBus o-- DeltaCoalescer : assistant_delta batching
+    ServiceBus ..> EventBus : forwards to the owner's session
+    ApprovalStore ..> Decision
+    Session ..> ApprovalStore : owner-scoped, memory approvals outlive the session
 ```
 
 ## 2. The turn pipeline: a chain of chains
@@ -126,7 +169,7 @@ classDiagram
         +Session session
         +UserMessage inbound
         +Map~String,PromptFragment~ prompt
-        +Map~String,Skill~ skills
+        +Map~String,SkillSummary~ skills
         +Map~String,ToolDefinition~ tools
         +ClassifierRule[] rules
         +ScoredMemory[] memories
@@ -162,6 +205,8 @@ classDiagram
     class Layer {
         +String name
         +int position
+        +Section[] allowedSections
+        +boolean mayLock
         +Map~HookName,InnerChain~ hooks
         +run(HookName, TurnContext, payload) Outcome
     }
@@ -185,11 +230,16 @@ classDiagram
         <<enumeration>>
         gating
         contributing
+        consuming
     }
     class ContributingStep {
         <<abstract>>
         +fetch(TurnContext, payload) Object
         +apply(TurnContext, Object)
+    }
+    class ConsumingStep {
+        <<abstract>>
+        +run(TurnContext, MemoryCandidate) Outcome
     }
     class Outcome {
         <<abstract>>
@@ -236,11 +286,22 @@ classDiagram
     class ModelAuditStep {
         +ClassifierEngine engine
     }
+    class SkillAutoLoadStep
+    class LoadedSkillsStep
+    class MiningRetagStep
+    class ScratchAcceptStep
+    class SessionInstructionsStep
+    class ClientToolsStep
+    class SessionRulesStep
+    class SessionScratchStep
+    class FlagStep
     class StepDecorator {
         +Step inner
     }
     class TimedStep
     class FailOpenStep
+    class FailClosedStep
+    class RequiredStep
     class DryRunStep
     class LayerFactory {
         +forEntry(LayerConfig, AccessToken) Layer
@@ -271,7 +332,21 @@ classDiagram
     Action <|-- Accepted
     Action <|-- Discarded
     Step <|.. ContributingStep
+    Step <|.. ConsumingStep
+    ConsumingStep <|-- RouteToTeamStep
+    ConsumingStep <|-- RouteToPersonalStep
+    ConsumingStep <|-- ScratchAcceptStep
     Step ..> StepKind
+    Step <|.. SkillAutoLoadStep
+    Step <|.. LoadedSkillsStep
+    Step <|.. MiningRetagStep
+    Step <|.. SessionInstructionsStep
+    Step <|.. ClientToolsStep
+    Step <|.. SessionRulesStep
+    Step <|.. SessionScratchStep
+    Step <|.. FlagStep
+    StepDecorator <|-- FailClosedStep
+    StepDecorator <|-- RequiredStep
     Step <|.. GateStep
     Step <|.. PromptFragmentsStep
     Step <|.. SkillDiscoveryStep
@@ -279,8 +354,6 @@ classDiagram
     Step <|.. MemorySearchStep
     Step <|.. RuleLoadStep
     Step <|.. StaticRulesStep
-    Step <|.. RouteToTeamStep
-    Step <|.. RouteToPersonalStep
     Step <|.. ModelAuditStep
     Step <|.. StepDecorator
     StepDecorator o-- Step : wraps
@@ -298,10 +371,10 @@ Which steps run at which hook (standard set):
 
 | Hook                  | Steps                                                                 |
 |-----------------------|-----------------------------------------------------------------------|
-| `on_message`          | GateStep, PromptFragmentsStep, SkillDiscoveryStep, SkillAutoLoadStep, LoadedSkillsStep (implicit), ToolDefinitionsStep, MemorySearchStep, RuleLoadStep |
+| `on_message`          | GateStep (gating), PromptFragmentsStep, SkillDiscoveryStep, SkillAutoLoadStep, LoadedSkillsStep (implicit), ToolDefinitionsStep, MemorySearchStep, RuleLoadStep (contributing); session layer: SessionInstructionsStep, ClientToolsStep, SessionRulesStep, SessionScratchStep |
 | `on_tool_call`        | RiskEscalationStep + ScopeGateStep (service, first); StaticRulesStep per layer; ModelAuditStep (service, last) |
-| `on_memory_candidate` | MiningRetagStep + RouteToTeamStep (team layers), RouteToPersonalStep (user layer), ScratchAcceptStep (session); restrictive mining rules run once before this hook |
-| `on_turn_end`         | AuditLogStep, metrics steps                                            |
+| `on_memory_candidate` | MiningRetagStep (contributing) + RouteToTeamStep (consuming) in team layers, RouteToPersonalStep (consuming) in the user layer, ScratchAcceptStep (consuming) in the session layer; restrictive mining rules run once before this hook |
+| `on_turn_end`         | FlagStep (a layer may emit `turn_flagged`); audit persistence is the service's AuditLogListener, not a step |
 
 Precedence per accumulator on `put`:
 
@@ -452,7 +525,13 @@ classDiagram
     class CapabilityCheckedRunner
     class TimeoutRunner
     class RateLimitedRunner
+    class ConcurrencyRunner
     class AuditedRunner
+    class SecretsProvider {
+        <<interface>>
+        +get(name) String
+        +redactionPatterns() Pattern[]
+    }
     class ToolDispatcher {
         +dispatch(ToolCall) Result
     }
@@ -516,6 +595,8 @@ classDiagram
     RunnerDecorator <|-- CapabilityCheckedRunner
     RunnerDecorator <|-- TimeoutRunner
     RunnerDecorator <|-- RateLimitedRunner
+    RunnerDecorator <|-- ConcurrencyRunner
+    ToolRunner ..> SecretsProvider : resolves by name at run time, redacts results with its patterns
     RunnerDecorator <|-- AuditedRunner
 ```
 
@@ -533,7 +614,9 @@ classDiagram
         +Layer layer
         +Audience suggestedAudience
         +MemoryId promotedFrom
+        +MemoryId[] supersedes
         +MemoryId supersededBy
+        +String hash
         +PrincipalId owner
         +float confidence
         +boolean pinned
@@ -546,7 +629,10 @@ classDiagram
     class ScoredMemory {
         +Memory memory
         +float score
+        +int rank
+        +boolean pinned
         +Layer layer
+        +Layer[] alsoIn
     }
     class MemoryCandidate {
         +MemoryKind kind
@@ -563,13 +649,15 @@ classDiagram
         +MemoryId promotedFrom
         +TurnId sourceTurn
         +String hash
+        +String retaggedBy
+        +boolean explicit
     }
     class MemoryStore {
         <<interface>>
         +search(query, AccessToken, opts) ScoredMemory[]
-        +get(MemoryId) Memory
+        +get(MemoryId, AccessToken) Memory
         +list(AccessToken, filter) Memory[]
-        +touch(MemoryId, usedAt)
+        +touch(MemoryId, AccessToken, usedAt)
     }
     class MemoryWriter {
         <<interface>>
@@ -577,7 +665,7 @@ classDiagram
         +update(MemoryId, patch)
         +delete(MemoryId)
     }
-    class MemoryMergeStep {
+    class MemoryMerge {
         +merge(TurnContext) ScoredMemory[]
     }
     class MergeStrategy {
@@ -602,8 +690,8 @@ classDiagram
         +apply(Memory[]) Memory[]
     }
 
-    MemoryMergeStep *-- MergeStrategy
-    MemoryMergeStep ..> ScoredMemory : from ctx.memories
+    MemoryMerge *-- MergeStrategy
+    MemoryMerge ..> ScoredMemory : from ctx.memories (a strategy the core invokes, not a step)
     MergeStrategy <|.. ReciprocalRankFusion
     MergeStrategy <|.. LayerBoostedRank
     MergeStrategy <|.. CrossEncoderRerank
@@ -638,7 +726,7 @@ classDiagram
         +fragments(AccessToken, Session) PromptFragment[]
     }
     class PromptAssembler {
-        +assemble(TurnContext, budget) String
+        +assemble(TurnContext, budget) AssembledPrompt
         +fragmentsUsed() PromptFragment[]
     }
     class RenderStrategy {
@@ -676,9 +764,32 @@ classDiagram
         +Layer layer
         +Role role
         +RuleKind kind
-        +Predicate match
+        +Match match
         +boolean locked
         +String body
+    }
+    class Role {
+        <<enumeration>>
+        tool_audit
+        memory_mining
+        memory_recall
+    }
+    class AuditStore {
+        <<interface>>
+        +write(AuditRecord)
+        +query(filter, AccessToken) AuditRecord[]
+        +retention
+    }
+    class AuditRecord {
+        +String id
+        +Instant ts
+        +PrincipalId owner
+        +SessionId sessionId
+        +TurnId turnId
+        +String kind
+        +Object ref
+        +Layer layer
+        +Object payload
     }
     class ClassifierRuleSource {
         <<interface>>
@@ -690,6 +801,7 @@ classDiagram
     class ModelAuditStep {
         +ClassifierEngine engine
         +Thresholds thresholds
+        +Risk alwaysAuditRiskGte
     }
     class RiskEscalationStep
     class ScopeGateStep
@@ -716,7 +828,7 @@ classDiagram
         +Mismatch mismatch
     }
     class MemoryMiner {
-        +observe(Turn) MemoryCandidate[]
+        +mine(turns, hints, instructions) MemoryCandidate[]
     }
     class Verdict {
         +Decision decision
@@ -734,6 +846,9 @@ classDiagram
     StaticRulesStep ..> ClassifierRule : reads this layer's rules from ctx.rules
     ModelAuditStep --> ClassifierEngine
     ModelAuditStep ..> Verdict : thresholds turn AuditOutput into a Verdict
+    ModelAuditStep --> AuditStore : audit.write
+    AuditStore ..> AuditRecord
+    ClassifierRule ..> Role
     Step <|.. StaticRulesStep
     Step <|.. ModelAuditStep
     ClassifierEngine <|.. ModelEngine
@@ -829,7 +944,7 @@ classDiagram
     ModelClient <|.. LocalModelClient
     ModelClient <|.. FakeModelClient
     AgentCore --> PromptAssembler : merge step
-    AgentCore --> MemoryMergeStep : merge step
+    AgentCore --> MemoryMerge : merge strategy
     AgentCore --> RecallPolicy : merge step
     AgentCore --> ToolDispatcher
     OuterChain ..> ModelAuditStep : appended after last layer
@@ -847,7 +962,7 @@ classDiagram
 | all `Source`s, `Layer`s and their `Step`s (cached per layer/team) | `Session`, `Conversation`, `EventBus` |
 | `ClassifierEngine`, `ModelAuditStep`              | `AccessToken` (validated per request)|
 | `LayerFactory`, `StepFactory`, `SourceFactory`, `ToolRunnerFactory` | `OuterChain` (built per token) |
-| `PromptAssembler`, `MemoryMergeStep`, `ModelClient` | `TurnContext` and its accumulators |
+| `PromptAssembler`, `MemoryMerge`, `ModelClient`, `AuditStore`, `SecretsProvider` | `TurnContext` and its accumulators |
 
 ## Viewing
 

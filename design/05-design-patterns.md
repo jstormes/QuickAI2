@@ -10,7 +10,7 @@ does which job so the code has a shared vocabulary.
 ## Chain of Responsibility, twice: layers and steps
 
 ```
-chain_for(token) -> [Layer]                    # outer: global, team:T (per group), user, session
+chain_for(token, session) -> [Layer]           # outer: global (always), team:T (per group), user, session (always)
 layer.hooks[hook_name] -> [Step]               # inner: this layer's steps for that hook
 step.run(ctx, payload) -> Continue | Stop(Action)
 ```
@@ -19,8 +19,11 @@ step.run(ctx, payload) -> Continue | Stop(Action)
   four hook points: `on_message`, `on_tool_call`, `on_memory_candidate`,
   `on_turn_end`.
 - **Inner chain** = the steps a layer runs at that hook, in configured
-  order. Gating steps may `Stop`; contributing steps only append. A
-  `Stop` anywhere stops everything.
+  order. Steps have a kind: `gating` steps may `Stop` the whole hook;
+  `contributing` steps only append; `consuming` steps (only in
+  `on_memory_candidate`) stop their hook by consuming the candidate
+  (`Stop(Accepted)` / `Stop(Discarded)`) or by asking. A `Stop` from a
+  gating step stops everything.
 - Precedence is chain order: later steps overwrite earlier unlocked
   values in the accumulators (`ctx.prompt`, `ctx.skills`, `ctx.tools`),
   so user beats team beats global. `locked` marks a value final.
@@ -92,7 +95,10 @@ On steps:
   `context_ready` event.
 - `FailOpenStep` / `FailClosedStep` decide what happens when a step's
   backend is unreachable (default: fail closed for gating steps, fail
-  open for contributing steps; configurable per step).
+  open for contributing and consuming steps; `required: true` on a
+  contributing step fails the turn instead). A consuming step that fails
+  open logs, emits `memory_discarded(reason=store_error)`, queues the
+  candidate on `session.unmined_candidates`, and returns `Continue`.
 - `DryRunStep` logs what a gating step would have stopped, stops nothing.
   Used to calibrate new global rules.
 
@@ -101,12 +107,14 @@ On tool runners: `SandboxedRunner`, `CapabilityCheckedRunner`,
 engine: `DryRunClassifier`, `AuditedClassifier`. Wrap order is set by
 the factory and can be mandatory for less trusted layers.
 
-## Strategy: the merge steps
+## Strategy: the merge stage
 
-Merge steps run after `on_message`, on what every layer contributed.
-They have no layer, so they are strategies rather than steps.
+The merge stage runs after `on_message`, on what every layer contributed.
+It has no layer, so its parts are strategies invoked by the core, not
+steps: `MemoryMerge` for `ctx.memories`, `PromptAssembler.assemble(ctx,
+budget)` for `ctx.prompt`, `RecallPolicy` for what enters the prompt.
 
-- `MergeStrategy` for `ctx.memories`: reciprocal rank fusion (default),
+- `MemoryMerge` for `ctx.memories`: reciprocal rank fusion (default),
   layer-boosted rank, cross-encoder rerank.
 - `RenderStrategy` for the assembled prompt: plain text, tagged sections,
   markdown headers; chosen per model or deployment.
@@ -122,8 +130,8 @@ Small ordered steps applied to a list, each pluggable:
 
 - Recall: `ctx.memories` → filter (age, kind, pinned) → token budget → cite.
 - Prompt budget: drop `optional` fragments first, never drop `locked`.
-- Memory mining: miner candidates → layered `memory_mining` rules (locked
-  first) → routing.
+- Memory mining: miner candidates → restrictive `memory_mining` rules from
+  every layer, in layer order → routing (consuming steps).
 
 ## Observer: the event stream
 
@@ -152,7 +160,9 @@ layer forwards them to the one owning client; internal listeners
 ## What this buys
 
 - Adding a layer is adding an entry to the layer list; the factory builds
-  its steps. Removing one (solo deployment) is deleting the entry.
+  its steps. Removing a team layer is deleting the entry; `global` and
+  `session` are always present, so a solo deployment is global (builtin
+  tools and default fragments only), user, session.
 - Adding a source to a layer is adding a step. Adding a resource kind is
   adding a step class and an accumulator on `TurnContext`.
 - Every layer can use different adapters, and one adapter can back

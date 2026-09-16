@@ -30,9 +30,10 @@ rest of the design intact.
    layer; widening rules run in their own layer's
    `on_memory_candidate` step. The pipeline note now says the same as
    the walkthrough.
-6. **Rule ordering wording unified**: restrictions accumulate across
-   layers, an unlocked `allow` yields to them, a locked `allow` shields.
-   No "locked-first" evaluation anywhere.
+6. **Rule ordering wording unified**: restrictive rules are evaluated in
+   layer order and accumulate across layers; `locked` matters only for
+   `allow` (a locked `allow` shields the call from later layers, an
+   unlocked one yields to any restriction).
 7. **Context-window overflow**: the core checks `count_tokens` before
    every model call; with provider compaction available it enables it,
    otherwise it emits `context_exhausted`, ends the session (mining and

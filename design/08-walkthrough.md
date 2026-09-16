@@ -53,18 +53,21 @@ main(config_path):
   steps.register("route_to_personal", RouteToPersonalStep)
   steps.register("retag",             MiningRetagStep)        # widening mining rules of this layer (§6d)
   steps.register("auto_load",         SkillAutoLoadStep)      # trigger-based skill auto-load (§15e)
-  steps.register("audit_log",         AuditLogStep)           # on_turn_end: persists this turn's verdict trace to the audit store (§8g)
+  steps.register("flag",              FlagStep)               # on_turn_end: a layer may flag a turn for review (§3d); never changes the reply
   # Implicit steps the factory always adds, never configured:
   #   LoadedSkillsStep  (every layer, on_message)  re-puts tools/fragments of skills loaded at that layer (§15f)
   #   RiskEscalationStep, ScopeGateStep (service, first in on_tool_call), ModelAuditStep (service, last)  (§8c, §8d)
   #   the SessionLayer's own steps (§14a)
+  # Audit persistence is NOT a step: the service-level AuditStore (audit.write(...)) is the single writer, fed by the
+  # AuditLogListener on the event bus (§17h) and by direct audit.write calls in the classifier and runners (§8d, §12b).
+  audit = AuditStoreFactory.create(config.audit)                    # write(AuditRecord), query(filter, token), retention
 
   # --- shared, service-level singletons
   model      = ModelClientFactory.create(config.model)              # e.g. anthropic adapter
   classifier = ClassifierEngineFactory.create(config.classifier, model)
   runners    = ToolRunnerFactory(config.tools.runners)             # script/http/builtin/client
   assembler  = PromptAssembler(RenderStrategy.for(config.model))
-  merger     = MemoryMergeStep(MergeStrategy.by_name(config.memory.merge or "rrf"))
+  merger     = MemoryMerge(MergeStrategy.by_name(config.memory.merge or "rrf"))
   recall     = RecallPolicy(config.memory.recall)
   miner      = classifier.miner()                                   # same engine, mining role
   events     = EventBusFactory()
@@ -88,22 +91,25 @@ Step protocol (what the factory and the hooks rely on):
 
 ```
 Step {
-  kind: gating | contributing            # declared by the step class; the registry records it
-  run(ctx, payload) -> Continue | Stop   # gating steps implement run directly
+  kind: gating | contributing | consuming   # declared by the step class; the registry records it
+  run(ctx, payload) -> Continue | Stop      # gating and consuming steps implement run directly
 }
 ContributingStep(Step) {
   fetch(ctx, payload) -> result          # I/O only; may run concurrently with other layers' fetches (§3a)
   apply(ctx, result)  -> None            # pure; applied in chain order; may call ctx.put
-  run(ctx, payload) = apply(ctx, fetch(ctx, payload)); return Continue      # sequential form, used by outbound hooks
+  run(ctx, payload) = apply(ctx, fetch(ctx, payload)); return Continue      # sequential form, used by the post-model hooks
 }
+# consuming: exists only in on_memory_candidate. A consuming step may return Stop(Accepted), Stop(Discarded) or
+#   Stop(RequireApproval); "Stop" there means "this candidate is consumed", it never affects other candidates or hooks.
+#   RouteToTeamStep, RouteToPersonalStep and ScratchAcceptStep are consuming.
 # Fail modes are derived from kind unless the config overrides them:
 #   gating       -> FailClosedStep (backend down => Stop(Deny("policy source unavailable")))
 #   contributing -> FailOpenStep   (backend down => contributes nothing; context_ready reports it)
+#   consuming    -> fail open: a failed store write logs, emits memory_discarded(reason=store_error), appends the
+#                   candidate to session.unmined_candidates (re-offered by the next mining job, §6a) and returns Continue
+#                   so the next layer may still accept it.
 #   required: true on a contributing step wraps it in RequiredStep instead: backend down => the turn fails with
-#             error{code: source_unavailable, source}. Only allowed on contributing steps; config validation rejects it on gating ones.
-# Routing steps (RouteToTeamStep, RouteToPersonalStep) are contributing: a failed store write logs, emits
-#   memory_discarded(reason=store_error), pushes the candidate to session.unmined_candidates for the next mining
-#   job, and returns Continue so the next layer may still accept it.
+#             error{code: source_unavailable, source}. Only allowed on contributing steps; config validation rejects it elsewhere.
 ```
 
 `LayerFactory.for_entry`, called by `prebuild` and lazily later:
@@ -111,7 +117,8 @@ ContributingStep(Step) {
 ```
 LayerFactory.for_entry(entry, token=None) -> Layer:
   vars  = { team_id: token?.current_team, subject: token?.subject,
-            user_root: f"{config.users_root}/{token?.subject}" }      # every user-layer path MUST be under user_root (G37)
+            user_root: f"{config.users_root}/{path_safe(token?.subject)}" }   # every user-layer path MUST be under user_root
+  # path_safe(sub): percent-encode every byte outside [A-Za-z0-9._-]; injective; if the result exceeds 255 bytes use sha256 hex
   layer = Layer(name=entry.name, hooks={})
   for hook_name, step_configs in entry.hooks:
       chain = InnerChain()
@@ -119,7 +126,7 @@ LayerFactory.for_entry(entry, token=None) -> Layer:
           source = sources.create(kind_for(sc.step), sc.adapter, expand(sc, vars)) if sc.adapter
           step   = steps.create(sc.step, source, sc)
           step   = TimedStep(step)
-          step   = FailClosedStep(step) if sc.gating else FailOpenStep(step)
+          step   = FailClosedStep(step) if step.kind == gating else FailOpenStep(step)
           if sc.required: step = RequiredStep(step)
           chain.append(step)
       layer.hooks[hook_name] = chain
@@ -132,8 +139,10 @@ Malformed source content is handled per item, never per source:
 Source.items(token):                                 # every adapter, every resource kind
   for raw in read_all():
       item = validate(raw, schema_for(kind))         # front matter / yaml / json schema; tool input_schema must compile
-      if item.error:  emit(source_item_invalid, source, raw.id, item.error); audit_log(...); continue   # skip it
+      if item.error:  emit(source_item_invalid, source, raw.id, item.error); audit.write(kind=source_write, ...); continue   # skip it
       if item.id in seen: warn(duplicate id, first wins); continue
+      if item.locked and not layer_config.may_lock:          # layers[].may_lock: global true, team false unless set, user/session never
+          item.locked = False; emit(source_item_invalid, source, raw.id, "lock_not_allowed")   # loaded unlocked, with a warning
       seen.add(item.id); yield item
 # Skill-specific: a tool whose `requires` exceeds Skill.capabilities is clipped (tools.on_excess) with a warning;
 # a tool whose input_schema does not compile is hidden. A source that cannot be read at all is "unreachable" and the
@@ -147,8 +156,12 @@ Source.items(token):                                 # every adapter, every reso
 POST /sessions  Authorization: Bearer <jwt>  { "active_team": "team-a" }
 
 ApiLayer.create_session(request):
-  token = validator.validate(request.bearer)          # sub, scopes, groups, exp
-  if request.body.active_team not in token.groups: return 403
+  token = validator.validate(request.bearer)          # sub, scopes, groups, exp; 401 unauthorized | token_expired
+  if sessions.count(owner=token.subject, state != ended) >= config.sessions.max_per_subject (20): return 429 { error: rate_limited }
+  if create_rate(token.subject).exceeded(config.sessions.create_rate (10/min)):              return 429 { error: rate_limited }
+  if request.body.active_team not in token.groups: return 403 { error: team_not_in_groups }
+  if len(request.body.instructions or "") > 8192 or len(request.body.client_tools or []) > 64 or len(request.body.gates or []) > 64:
+      return 400 { error: bad_request }
   session = Session(id=new_id(), owner=token.subject, token=token,
                     active_team=request.body.active_team,
                     conversation=Conversation(), bus=events.new())
@@ -165,7 +178,7 @@ until the token changes):
 ```
 AccessToken helpers (they live on the token object; the scope word for layer `user` is `personal`):
   allows(layer, verb, resource) -> scopes has f"{verb}-{scope_word(layer)}-{resource}" and (layer is not team or current_team in groups)
-  allows_any(layer)             -> any use-* scope for that layer
+  allows_any(layer)             -> any use-* or create-* scope for that layer
   with_team(team_id)            -> a view of the same token with current_team = team_id
   scope_word(layer)             -> "global" | "team" | "personal" (for layer user)
 
@@ -195,6 +208,20 @@ LayerFactory.chain_for(token, session) -> OuterChain:
 # So a personal-only token still gets global locked rules and org policy
 # fragments, but no global skills, tools, or memories.
 
+Token validation, configured under `api.auth` (02-layering-and-composition.md):
+
+```
+api.auth:
+  adapter: oauth2_jwt | dev_idp
+  issuer, audience
+  jwks_url | introspection_url          # one of; introspection also reports revocation (§11d)
+  clock_skew_s: 60
+  scope_claim: scope, scope_claim_format: space | array
+  groups_claim: groups
+  dev_idp: { subject, scopes: [...], groups: [...] }   # single-user mode only; elsewhere a startup warning
+validator.validate(bearer) -> AccessToken | 401 { error: unauthorized | token_expired }
+```
+
 Suppose the token has scopes
 `use-global-skill use-team-skill use-personal-skill use-global-memory
 use-personal-memory create-personal-memory use-team-memory
@@ -217,8 +244,8 @@ POST /sessions/{id}/messages { "text": "Check whether the nightly build passed..
 Idempotency-Key: <client uuid>          # optional; a repeat within 24 h returns the original response (also on /tool-results)
 -> 202 { turn_id }
 # ?wait=true: the response is held until turn_complete (200 with the final assistant message), or until the turn parks on
-# an approval or a client tool call, in which case 202 is returned with { turn_id, state, pending } and the client continues
-# over the stream.
+# an approval or a client tool call, or api.wait_max_s (30) elapses, in which case 202 is returned with
+# { turn_id, state, pending } and the client continues over the stream.
 ```
 
 ### 3a. `on_message`
@@ -277,8 +304,8 @@ session:
 Merge steps and the model call:
 
 ```
-  ctx.memories  = recall.select(merger.merge(ctx.memories), budget=1500 tokens)
-  system_prompt = assembler.assemble(ctx.prompt, budget=config.prompt_budget)
+  ctx.memories  = recall.select(MemoryMerge.merge(ctx.memories), budget=1500 tokens)   # a strategy the core calls, not a step
+  ctx.assembled = assembler.assemble(ctx, budget=config.prompt_budget)                 # -> AssembledPrompt; text in ctx.assembled.text
   tool_defs     = [t.definition for t in ctx.tools.values()] + skill_summaries(ctx.skills)
   emit(context_ready, timings=per_layer(results), counts=...)
 ```
@@ -294,24 +321,26 @@ end_turn_early(ctx, action):
     RequireApproval: not valid in on_message (config validation rejects a gating rule that asks on messages)
 
 GateStep(config).run(ctx):                                  # the standard on_message gate; declarative like everything else
-  if session.frozen: return Stop(Deny("session frozen"))    # set by POST /sessions/{id}/freeze (owner or read-audit-all holder) or a global rule
+  if session.frozen: return Stop(Deny("session frozen"))    # set by POST /sessions/{id}/freeze (owner or read-audit-all holder), §11e
   if rate_limiter(ctx.token.subject).exceeded(): return Stop(Deny("rate limit"))
   for pat in config.gate.content_deny_patterns: if pat.matches(ctx.inbound.text): return Stop(Deny(pat.reason))
   return Continue
 
 second POST /messages while session.turn.state != idle:
   -> 409 { error: turn_in_progress, turn_id }               # client cancels first, or waits for turn_complete
-  (config.messages.queue: reject | queue_one; default reject)
+  (config.messages.queue: reject | queue_one; default reject. queue_one holds at most one message; a second returns 409.)
+  Idempotency-Key reused with a different body -> 422 { error: unprocessable }
 
 model terminal conditions (agent loop, §3b):
   stop_reason max_tokens: append the partial assistant text as a normal assistant message;
                           emit(assistant_message, truncated=true); turn_complete(outcome=max_tokens); mining runs
-  stop_reason refusal:    append assistant("I can't help with that request." + category note); audit_log(refusal, category);
+  stop_reason refusal:    append assistant("I can't help with that request." + category note); audit.write(kind=refusal, category);
                           emit(assistant_message, refusal=category); turn_complete(outcome=refusal); mining runs
   error{fatal}:           emit(error, code=model_error, message); turn_complete(outcome=error); the user message stays in
                           history (append-only); no assistant turn is added; no mining
   error{retryable} after SDK retries: same as fatal with code=model_unavailable
-  SessionStore / EventLog write failure: emit(error, code=store_unavailable); turn_complete(outcome=error); events already
+  store write failure (SessionStore, EventLog, JobStore, AssetStore, ApprovalStore, AuditStore):
+                          emit(error, code=store_unavailable, store); turn_complete(outcome=error); events already
                           delivered are not rolled back; the client should reconnect and trust session_state
   token revoked mid-turn: if the validator supports introspection and reports revocation, cancel_turn(reason=token_revoked);
                           otherwise the turn finishes on the token it captured (§11d)
@@ -321,7 +350,7 @@ model terminal conditions (agent loop, §3b):
 
 ```
   loop:
-      stream = model.complete(system=system_prompt,
+      stream = model.complete(system=ctx.assembled.text,
                               messages=session.conversation.messages,     # already includes this turn's user message
                               tools=tool_defs)
       for chunk in stream:
@@ -376,7 +405,7 @@ tests), decides it needs the log, and loads the team skill.
 
 ```
   # model returns tool_call load_skill("nightly-triage")   (load_skill is a builtin global tool)
-  # on_tool_call -> ALLOW (static rule from team-a: allow nightly-triage.*)
+  # on_tool_call -> ALLOW by GLOBAL's unlocked allow for load_skill (§15d); no later restriction matches -> no model audit
   # executing it: SkillStore(team-a).load("nightly-triage") -> Skill
   #   ctx.tools.put("nightly-triage.fetch_log", locked=False)   at layer team-a
   #   ctx.prompt.put("nightly-triage", fragment)                 at layer team-a
@@ -384,10 +413,12 @@ tests), decides it needs the log, and loads the team skill.
   emit(skill_loaded, "nightly-triage", tools=["nightly-triage.fetch_log"])
 
   # model then calls nightly-triage.fetch_log(job=..., run=1234)
-  # on_tool_call: team-a static rule "allow nightly-triage.*" matches -> Stop? No:
-  #   an `allow` rule returns Continue with ctx.audit[call.id] = {verdict: ALLOW(rule), decided: True},
-  #   so ModelAuditStep is skipped.
-  # runner: script impl -> SandboxedRunner (every script impl is sandboxed; team-layer policy applies)
+  # RiskEscalationStep: declared medium, origin skill at layer team -> effective high (§8c)
+  # on_tool_call: global StaticRulesStep: locked require_approval (effective_risk >= high) matches FIRST -> Stop(RequireApproval)
+  #   (team-a's unlocked "allow nightly-triage.*" comes later in the chain and cannot lift a global restriction, §8b)
+  # approval_requested -> the user allows (§5) -> resume from the step after the asker; team-a allow now records ALLOW
+  #   and marks the call decided, so ModelAuditStep is skipped
+  # runner: script impl -> SandboxedRunner (every script impl is sandboxed; team policy = strict, §12d)
   # result: log excerpt with the 3 failing tests
 ```
 
@@ -400,13 +431,13 @@ to the two memories and the skill.
 
 ```
   session.conversation.append(final_message)
-  for layer in chain: layer.run("on_turn_end", ctx)            # e.g. global AuditLogStep:
-  #   AuditLogStep.run(ctx): for call_id, a in ctx.audit: audit_log.write(kind=verdict, ref=call_id, payload=a); return Continue
-  #   a layer may also emit(turn_flagged, turn_id, reason, by=layer) here for post-hoc review; it never changes the reply
-  emit(turn_complete, usage=...)
+  for layer in chain: layer.run("on_turn_end", ctx)            # layers may only observe here, e.g.:
+  #   FlagStep(layer, rules).run(ctx): if any(rule.match(ctx)): emit(turn_flagged, ctx.turn_id, reason=rule.id, layer); return Continue
+  #   the verdict trace in ctx.audit is persisted by the service (AuditLogListener -> audit.write), not by a layer step
+  emit(turn_complete, usage=..., outcome=ok)
 
   schedule_background:
-      candidates = miner.observe(ctx)
+      candidates = classifier.mine([ctx.snapshot()], hints, instructions)
       # e.g. { kind: project, body: "nightly run 1234 failed on test_upload_retry (flaky) and 2 others",
       #        audience: team:team-a, confidence: .7 }
       #      { kind: feedback, body: "user wants failures grouped by test file", audience: personal, .9 }
@@ -433,17 +464,19 @@ tool_call_proposed       ci_status  state=reviewing
 tool_call_started        ci_status                        (after model audit, ~400ms)
 tool_call_finished       ci_status  "failed: 3 tests"
 tool_call_proposed       load_skill nightly-triage  state=reviewing
-tool_call_started        load_skill                       (static allow, ~0ms)
+tool_call_started        load_skill                       (global unlocked allow, ~0ms)
 tool_call_finished       load_skill
 skill_loaded             nightly-triage  tools=[nightly-triage.fetch_log]
 tool_call_proposed       nightly-triage.fetch_log  state=reviewing
-tool_call_started        nightly-triage.fetch_log         (static allow)
+approval_requested       ap_12  nightly-triage.fetch_log  asked_by global.high-risk-needs-approval (locked)
+approval_resolved        ap_12  allow  by=<subject>
+tool_call_started        nightly-triage.fetch_log         (team allow after approval; no model audit)
 tool_call_finished       nightly-triage.fetch_log
 assistant_delta ...      the summary
 assistant_message        + citations
-turn_complete            usage
+turn_complete            usage  outcome=ok
 memory_created           team:team-a  "nightly run 1234 failed on …"
-memory_created           personal     (updated) "prefers failures grouped by test file"
+memory_updated           user         "prefers failures grouped by test file"
 ```
 
 ## 5. The approval flow
@@ -481,11 +514,13 @@ ModelAuditStep.run(ctx, call):                # appended by the service after th
 ```
 
 ```
-ApprovalRequest {                              # one shape for both kinds; stored in the session's ApprovalStore (retention = the session's)
-  approval_id, session_id, turn_id, kind: tool | memory
+ApprovalRequest {                              # one shape for both kinds; stored in the owner-scoped ApprovalStore (keyed by owner;
+                                               # session_id is an attribute). Tool approvals die with their session; memory
+                                               # approvals survive it and resolve by their own timeout.
+  approval_id, owner, session_id, turn_id, kind: tool | memory
   tool_call?:  { id, name, args, risk, layer, execute_on }        # kind=tool
   candidate?:  MemoryCandidate, team?: TeamId                     # kind=memory (§5g, §6e)
-  asked_by: { kind: rule | classifier | step, id, layer, locked: bool, remember_scope?: exact | tool }
+  asked_by: { kind: rule | classifier | step, id, layer, locked: bool, remember_match?: exact | tool }
   reason: text
   options: [allow, deny] | [accept_team, keep_personal, discard]
   remember_options: [once] or [once, session]  # `session` only if asked_by is unlocked; see 5e. Nothing longer exists.
@@ -554,14 +589,18 @@ ApiLayer.answer_approval(request):
 The client may also list what is outstanding after a reconnect:
 
 ```
-GET /sessions/{id}/approvals?state=pending -> [ApprovalRequest]
+GET /sessions/{id}/approvals?state=pending -> [ApprovalRequest]           # this session's
+GET /approvals?state=pending&kind=memory   -> [ApprovalRequest]           # all of the owner's, across sessions (memory kind survives session end)
+POST /approvals/{aid} { decision, ... }    -> same handler as the session-addressed form; owner check only
+# session_state (§11b) lists this session's pending ids plus pending_memory_approvals: <count> at owner level
 ```
 
 ### 5d. Resuming the chain
 
 ```
 resume_after_approval(decision, call, ctx, chain, resume_from):
-  emit(approval_resolved, call.id, decision.decision, by=decision.by)
+  emit(approval_resolved, req.approval_id, decision.decision, by=decision.by)
+  apply_remember(decision, req, ctx)                            # 5e; no-op for `once`
 
   if decision.decision == deny:
       ctx.audit[call.id].verdict = DENY("user declined" + decision.note); ctx.audit[call.id].decided = True
@@ -592,9 +631,9 @@ apply_remember(decision, req, ctx):
   match decision.remember:
     once:    nothing
     session: # add an unlocked allow rule to the session layer for the rest of this session
-             scope = req.asked_by.remember_scope or "exact"          # the ASKER's rule decides exact-args vs by-tool-name
+             m = req.asked_by.remember_match or "exact"              # the ASKER's rule decides exact-args vs by-tool-name
              ctx.session.rules.append(rule { kind: allow,
-                                             match: { tool: req.tool_call.name } + ({ args_hash: hash(req.tool_call.args) } if scope == exact),
+                                             match: { tool: req.tool_call.name } + ({ args_hash: hash(req.tool_call.args) } if m == exact),
                                              layer: session, locked: false })
 ```
 
@@ -613,8 +652,10 @@ the chat.
 
 ```
 on cancel(turn_id):                  # POST /sessions/{id}/cancel
-  for p in ctx.pending_approvals.values(): p.future.set(Deny("turn cancelled"))
-  model stream aborted; parked calls return error results; turn ends with turn_complete(cancelled=true)
+  for p in ctx.pending_approvals.values() if p.kind == tool: p.future.set(Deny("turn cancelled"))   # memory approvals untouched
+  model stream aborted. History stays valid: the partial assistant text and any emitted tool_call blocks are appended,
+  then ONE user message with tool_result(is_error, kind=cancelled) for each of those calls (§16b); then
+  turn_complete(outcome=cancelled)
 
 on timeout:                          # per request, from rule or config
   future defaults to Deny("approval timed out"); model is told; turn continues
@@ -673,6 +714,9 @@ AgentCore.after_turn(ctx):
 
 MiningJob.run():
   if session.mined_turns.contains(turn_id): return         # at-most-once per turn; the marker lives on the Session (SessionStore)
+  # Failure: any raise (deadline, error{fatal} from the classifier's ModelClient, store down) is retried with backoff up to
+  # config.mining.max_attempts (3); after that the turn is marked mined and audit.write(kind=memory, outcome=mining_failed).
+  for c in session.take_unmined_candidates(): route(ctx, c)  # candidates a consuming step could not write last time (§1 step protocol)
   # Durability: the job queue is in-process. A restart loses queued jobs, but every unmined turn is also
   # listed in session.unmined_turns (persisted), and the sweeper re-submits them (§11f). Concurrent
   # mining of two sessions of one user may race on similar candidates; stores make put() idempotent by
@@ -737,7 +781,7 @@ even though the team layer runs before theirs.
 ```
 prefilter(ctx, candidates):
   rules = ctx.rules.for_role("memory_mining").restrictive()      # kind in {drop, threshold, redact, disable}
-  ordered locked-first, then layer order
+  in layer order; `locked` is not special for restrictive rules (they accumulate regardless)
   if any(r.kind == disable for r in rules): return []            # any layer may disable; disabling is restrictive
   out = []
   for c in candidates:
@@ -782,11 +826,11 @@ MiningRetagStep(team-a).run(ctx, c):
 RouteToTeamStep(team-a).run(ctx, c):
   T = this_layer.team_id
   if c.audience != team:T: return Continue                # not for us
-  if c.provenance.teams - {T}:                            # the turn drew on ANOTHER team's memories or skills
-      signal = False                                      # no auto-accept: only explicit user confirmation may cross teams
   if not ctx.token.allows("team", "create", "memory") or T not in ctx.token.groups:
-      c.declined.append((T, "no scope")); return Continue  # falls through to personal
-  signal = (ctx.session.active_team == T) or any(r.auto_accepts(c) for r in this_layer.rules.auto_accept())
+      c.declined.append((T, "no scope")); return Continue  # falls through to the user layer
+  signal = c.explicit or (ctx.session?.active_team == T) or any(r.auto_accepts(c) for r in this_layer.rules.auto_accept())
+  if c.provenance.teams - {T} and not c.explicit:         # the turn drew on ANOTHER team's memories or skills
+      signal = False                                      # no auto-accept: only explicit user confirmation may cross teams
   if not signal:
       return Stop(RequireApproval(ApprovalRequest.memory(c, team=T, options=[accept_team, keep_personal, discard],
                                                           timeout_s=config.mining.confirm_timeout_s,
@@ -798,6 +842,7 @@ User layer:
 
 ```
 RouteToPersonalStep.run(ctx, c):
+  if c.kind == scratch or c.audience == session: return Continue          # scratch belongs to the session layer (§14d)
   if not ctx.token.allows("user", "create", "memory"): return Continue     # scope word for layer user is "personal"
   if c.declined: c.suggested_audience = c.declined[0].team    # keep the hint for promotion
   return write_to(this_layer.store, ctx, c, layer=user)
@@ -807,6 +852,8 @@ Writing, with dedupe against the target store:
 
 ```
 write_to(store, ctx, c, layer) -> Stop:
+  # Memory.hash = sha256(normalise(body)); normalise = NFC, lowercase, collapse whitespace, strip trailing punctuation.
+  # Stores index the hash and make put() idempotent on it within config.mining.dedupe_window.
   near = store.search(c.body, ctx.token, top_k=3, filter={kind: c.kind})
   match classify_overlap(c, near):
     # No model call here. Three outcomes, decided in this order:
@@ -827,7 +874,7 @@ write_to(store, ctx, c, layer) -> Stop:
 
 For the example: `c1` is tagged `team:team-a`, the session's active team
 is `team-a`, so it is accepted into the team store, linked to the
-existing "nightly job name" memory. `c2` is personal; the user store
+existing "nightly job name" memory. `c2` is for the user layer; the user store
 finds `mem_user_04` ("prefers failures grouped by test file", recalled
 earlier) as a duplicate and updates it instead of inserting. `c3` never
 reached routing.
@@ -839,7 +886,7 @@ auto-accept rule, `RouteToTeamStep` would have asked:
 
 ```
 await_confirmation(ctx, c, req, resume_from):
-  session.approvals.save(req)                                # same store as tool approvals, kind=memory
+  approvals.save(req)                                        # owner-scoped store, kind=memory; outlives the session
   emit(memory_confirm, req)                                  # may arrive after turn_complete
   decision = await future(req).with_timeout(req.timeout_s, default=req.on_timeout)   # keep_personal
   emit(memory_decision_resolved, req.approval_id, decision)
@@ -867,13 +914,13 @@ POST /sessions/{id}/approvals/mc_12  { "decision": "keep_personal" }
 Timeout policy differs from tool approval on purpose: nothing is blocked,
 so the window is long and the fallback is the safe one (`keep_personal`),
 never `discard`. A client that does not implement memory prompts simply
-never answers, and every such candidate lands in personal with a
+never answers, and every such candidate lands in the user layer with a
 suggestion attached.
 
 ### 6f. Promotion later
 
 ```
-GET  /memories?suggested_for=team:team-a          -> personal memories with suggested_audience == team-a
+GET  /memories?suggested_for=team:team-a          -> user-layer memories with suggested_audience == team-a
 POST /memories/{id}/promote?layer=team:team-a
 
 ApiLayer.promote(request):
@@ -882,10 +929,12 @@ ApiLayer.promote(request):
   if m.layer != user or m.owner != token.subject: return 404
   if not token.allows("team", "create", "memory") or T not in token.groups: return 403
   c = MemoryCandidate.from_memory(m, audience=team:T, confidence=1.0, promoted_from=m.id)
-  c = prefilter(ctx_for(token, session), [c])              # locked restrictive rules still apply
+  ctx = TurnContext.lightweight(token, session=None)       # session-less: no session layer, active_team absent
+  c = prefilter(ctx, [c])                                   # restrictive rules still apply
   if not c: return 422 "blocked by policy"
-  r = RouteToTeamStep(T).run(ctx, c[0], force_signal=True)  # explicit user act is the positive signal
-  return 201 { memory_id, promoted_from: m.id }             # personal copy stays; new memory links back
+  c[0].explicit = True                                      # the explicit user act is the positive signal (§6d)
+  r = RouteToTeamStep(T).run(ctx, c[0])
+  return 201 { memory_id, promoted_from: m.id }             # the user-layer copy stays; new memory links back
 ```
 
 ### 6g. Event timeline (for the turn in section 3)
@@ -893,7 +942,7 @@ ApiLayer.promote(request):
 ```
 turn_complete
 memory_created           team:team-a  mem_team_a_23  "Nightly run 1234 … failed …"  links=[mem_team_a_17]
-memory_updated           personal     mem_user_04    "Prefers CI failures grouped by test file"
+memory_updated           user         mem_user_04    "Prefers CI failures grouped by test file"
 # (c3 dropped silently by the locked global credential rule; visible only in the audit log)
 ```
 
@@ -902,10 +951,10 @@ And in a session with no active team:
 ```
 turn_complete
 memory_confirm           mc_12  team-a  "Nightly run 1234 … failed …"
-memory_updated           personal     mem_user_04
+memory_updated           user         mem_user_04
    ... user answers keep_personal, or the window lapses ...
 memory_decision_resolved mc_12  keep_personal
-memory_created           personal     mem_user_31  suggested_audience=team-a
+memory_created           user         mem_user_31  suggested_audience=team-a
 ```
 
 ## 7. Skill fork and override
@@ -953,9 +1002,9 @@ ApiLayer.fork_skill(request):
   fork.tools = [t for t in fork.tools if t not in excess]
   for t in fork.tools: t.layer = target                         # so runners sandbox by the fork's layer, not the base's
 
-  fork.version = content_hash(fork)
+  fork.version = content_hash(fork)                            # sha256 of canonical JSON (sorted keys) of the skill without `version`
   target_store.writer.put(fork)
-  emit_global(skill_forked, fork.id, from=base.id, by=token.subject)
+  service_bus.publish_to_owner(token.subject, skill_forked, {id: fork.id, from: base.id})
   return 201 { skill_id: fork.id, derived_from: fork.derived_from, stripped_tools: [..] }
 ```
 
@@ -1169,7 +1218,7 @@ rules:
   - id: read-only-tools-are-fine
     role: tool_audit
     kind: allow
-    locked: true                                                 # shields from lower-layer nagging
+    locked: true                                                 # shields from later layers' restrictions
     match: { tool_in: [ci_status, read_file, search_memory] }
 
   - id: audit-instructions
@@ -1189,7 +1238,7 @@ rules:
 
 ```
 ClassifierRule {
-  id, layer, source, role: tool_audit | memory_mining
+  id, layer, source, role: tool_audit | memory_mining | memory_recall
   kind:   deny | require_approval | allow | prompt_fragment | threshold | drop | redact | retag | auto_accept | disable
   match:  Match                              # fixed fields, no expression language (v1)
   locked: bool
@@ -1206,6 +1255,11 @@ Match (tool_audit) = all of the present fields must hold:
   execute_on                         # server | client
   args_match: { field: glob }        # shallow, string-valued args only
   skill                              # owning skill name, if any
+
+Match (memory_mining) = all of the present fields must hold:
+  kind | kind_in | audience | body_matches (regex) | confidence_lt | tags_any | source_turn_has_team
+Match (memory_recall):
+  kind_in | tags_any | layer
 ```
 
 Loading is the `RuleLoadStep` in `on_message`; each layer appends its own
@@ -1235,8 +1289,15 @@ So:
 - A user cannot remove global's `high-risk-needs-approval`: it is
   restrictive, and restrictions accumulate.
 - Global's `read-only-tools-are-fine` is a **locked allow**: it shields
-  those tools from lower-layer restrictions, so a team cannot make
+  those tools from later layers' restrictions, so a team cannot make
   `ci_status` require approval. Unlock it and the team could.
+- An **unlocked** `allow` in a team or user layer skips the model audit
+  for a global tool for that team's members or that user. This is an
+  accepted risk (`09-threat-model.md`), bounded two ways: global's locked
+  `require_approval` for effective risk ≥ high still fires first, and
+  `classifier.always_audit_risk_gte` (default `high`) makes the model
+  audit run anyway at or above that risk even when an unlocked allow
+  matched. Only a *locked* allow skips the model audit unconditionally.
 - Two peer teams with conflicting rules need no merge strategy: their
   restrictions both apply, and their allows both yield. The only true
   conflict is two locked allows for the same call, which is not a
@@ -1277,7 +1338,8 @@ not rules and cannot be configured away by a layer:
 ```
 RiskEscalationStep.run(ctx, call):
   d = ctx.tools.resolve(call.name)
-  bump = config.tools.risk_escalation.get(d.layer, 0)      # e.g. team: +1, global-from-skill: +1, session/client: +1
+  bump = max(config.tools.risk_escalation.get(k, 0) for k in [f"layer:{d.layer}", f"origin:{d.origin.kind}"])
+                                                           # keys are layer:<name> or origin:<kind>; e.g. layer:team +1, origin:skill +1, layer:session +1
   d.effective_risk = clamp(d.risk + bump)                  # what `effective_risk_gte` matches on
   return Continue
 
@@ -1296,7 +1358,9 @@ static rules and scope gates still apply.
 ```
 ModelAuditStep.run(ctx, call):
   a = ctx.audit[call.id]
-  if a.decided: return Continue
+  d = ctx.tools.resolve(call.name)
+  if a.decided and (a.shielded or d.effective_risk < config.classifier.always_audit_risk_gte): return Continue
+  # decided by an UNLOCKED allow at or above always_audit_risk_gte: audited anyway (§8b, accepted-risk bound)
   if ctx.token.scopes.has("bypass-tool-audit"): a.verdict = ALLOW(reason="bypass scope"); return Continue
   if engine.kind == rules_only:
       return default_for(config.classifier.undecided_default, call)    # allow | ask | deny | ask_if_risk_gte_<level>_else_allow
@@ -1314,7 +1378,7 @@ ModelAuditStep.run(ctx, call):
   # engine returns a structured verdict; thresholds turn confidence into a decision
   v = apply_thresholds(v, config.classifier.thresholds)       # e.g. allow if p_requested >= .85, deny if <= .15, else ask
   a.verdict = v; a.decided = True
-  audit_log.write(ctx, call, v, rules_considered=ctx.rules.of_role("tool_audit"), static_path=a.trace)
+  audit.write(ctx, call, v, rules_considered=ctx.rules.of_role("tool_audit"), static_path=a.trace)
   match v.decision:
     ALLOW:    return Continue
     DENY:     return Stop(Deny(reason=v.reason))
@@ -1343,7 +1407,7 @@ a change in the final args simply misses the cache and re-runs.
 DryRunStep(inner).run(ctx, call):
   r = inner.run(ctx, call)
   if r is Stop:
-      audit_log.write(ctx, call, would_have=r.action, dry_run=True)
+      audit.write(ctx, call, would_have=r.action, dry_run=True)
       emit(audit_dry_run, call.id, would_have=r.action.kind, by=r.action.source)
       ctx.audit[call.id].decided = False                     # let later steps and the model auditor proceed normally
       return Continue
@@ -1373,8 +1437,8 @@ Chain: global, team-a, user, session. Rules as in 8a plus team-a
 
 The fifth row is worth noticing: a team's unlocked `allow` cannot get a
 high-risk tool past global's locked `require_approval`. If the team truly
-needs that, the fix is upstream: global lowers the escalation for that
-team's tool layer, or the tool's declared risk is reduced by whoever
+needs that, the fix is upstream: global reduces the escalation for
+`layer:team`, or the tool's declared risk is reduced by whoever
 maintains it.
 
 ### 8g. Authoring rules
@@ -1383,7 +1447,9 @@ maintains it.
 POST /classifier/rules?layer=user        { id, role, kind, match, locked?: false, reason }
   -> requires create-personal-classifier-rule; `locked` is refused in any layer after global unless the layer's config allows it
   -> written to the user's rule source; takes effect at the next on_message (RuleLoadStep re-reads; sources may cache with TTL)
-POST /sources/refresh                    -> forces every RuleLoadStep source to re-read now
+POST /sources/refresh                    -> per adapter: git fetch, http cache invalidation, directory re-read; every source kind
+GET  /config/effective                   -> the validated, defaulted config with values under `secrets` and any `*_key` / `*_token`
+                                            key redacted (manage-sources)
 
 GET  /classifier/rules                   -> ctx.rules as the next turn would see them: ordered, with layer, locked, and
                                             for each rule whether the caller may edit it
@@ -1475,8 +1541,17 @@ When working for team-a, prefer the nightly-triage skill for CI questions.
 ```
 
 `condition` is a fixed-field predicate over the token and session
-(`active_team`, `client_kind`, `groups`, `scopes`, time window). No
-expression language in v1, matching classifier rules.
+(`active_team`, `client_kind: cli | web | app | other`, `groups`, `scopes`,
+`time_window: {after: "HH:MM", before: "HH:MM", tz}`). No expression
+language in v1, matching classifier rules. In a session-less context
+(`GET /prompt`, `GET /memories`, promote) conditions on `active_team`
+evaluate false.
+
+Which sections a layer may write to is configured per layer
+(`layers[].allowed_sections`; defaults global: all; team: `project,
+skills, tools`; user: `project, user_prefs`; session: `session`); skill
+fragments may only use `project` and `skills`. `identity` and `policy`
+are therefore global-only, whatever priority a later layer asks for.
 
 ### 9b. The fragments step
 
@@ -1487,6 +1562,8 @@ PromptFragmentsStep(layer).fetch(ctx):
 PromptFragmentsStep(layer).apply(ctx, fragments):
   for f in fragments:
       if f.condition and not f.condition.holds(ctx.token, ctx.session): continue
+      if f.section not in layer_config.allowed_sections:
+          emit(shadow_refused, "prompt", f.id, attempted_by=layer, reason="section"); continue   # e.g. a team fragment claiming `policy`
       f.layer = layer
       ctx.put("prompt", f.id, f, locked=f.locked)          # same put as skills/tools: locked ids are final
 ```
@@ -1496,6 +1573,7 @@ Skills add their fragments when loaded, at the skill's layer:
 ```
 on skill_loaded(skill, ctx):
   for f in skill.prompt_fragments:
+      if f.section not in (project, skills): emit(shadow_refused, "prompt", f.id, attempted_by=skill.layer, reason="section"); continue
       f.id = f.id or f"{skill.name}.{f.section}"; f.layer = skill.layer
       ctx.put("prompt", f.id, f, locked=False)             # skills never lock
   ctx.prompt_dirty = True                                  # next model call re-assembles
@@ -1621,7 +1699,7 @@ When working for team-a, prefer the nightly-triage skill for CI questions.
 Nightly triage: the job is build-nightly-linux; known-flaky tests are listed in flaky.txt in the repo.
 </project>
 <skills>
-- code-review (personal, overrides global; stale): review a diff against team conventions. tools: code-review.lint
+- code-review (user, overrides global; stale): review a diff against team conventions. tools: code-review.lint
 - nightly-triage (team-a, loaded): triage a failed nightly run. tools: nightly-triage.fetch_log
 - release-notes (global, locked): draft release notes from merged PRs.
 </skills>
@@ -1634,7 +1712,7 @@ Use US spelling.
 <memories>
 - [team-a] nightly job name is build-nightly-linux
 - [team-a] flaky test: test_upload_retry
-- [personal] prefers CI failures grouped by test file
+- [user] prefers CI failures grouped by test file
 </memories>
 <session>
 we're mid-incident
@@ -1693,7 +1771,7 @@ prompt_truncated         dropped=[uk-english]  shrunk=[__memories: 5->3]      # 
 
 Recall happens inside `on_message`: every layer's `MemorySearchStep`
 queries its own store concurrently, results are appended to
-`ctx.memories`, and two merge steps run afterwards: `MemoryMergeStep`
+`ctx.memories`, and two merge steps run afterwards: `MemoryMerge`
 (rank fusion and cross-layer dedupe) and `RecallPolicy` (what actually
 enters the prompt). No model call is involved.
 
@@ -1756,7 +1834,7 @@ user:    [ "prefers CI failures grouped by test file"   rank 1  score .74
 ### 10c. Merge: rank fusion, then cross-layer dedupe
 
 ```
-MemoryMergeStep.merge(ctx) -> [ScoredMemory]:
+MemoryMerge.merge(ctx) -> [ScoredMemory]:
   by_layer = group(ctx.memories, key=layer)
   fused = merge_strategy.merge(by_layer)                     # default: reciprocal rank fusion
   return dedupe_across_layers(fused)
@@ -1772,7 +1850,7 @@ ReciprocalRankFusion.merge(by_layer, k=60, boost=config.memory.layer_boost):
 dedupe_across_layers(fused):
   seen = {}
   for r in fused:
-      key = r.memory.promoted_from or r.memory.id            # a promoted memory exists in personal and team
+      key = r.memory.promoted_from or r.memory.id            # a promoted memory exists in the user and team layers
       if key in seen: seen[key].also_in.append(r.layer); continue
       if near_duplicate(r, seen.values()): continue          # same normalised body across stores
       seen[key] = r
@@ -1834,10 +1912,19 @@ inline marker the model can echo:
 
 ```
 <memories>
-- [m:team-a/17] nightly job name is build-nightly-linux
+- [m:team:team-a/17] nightly job name is build-nightly-linux
 - [m:user/04] prefers CI failures grouped by test file
 </memories>
 ```
+
+Markers carry the full layer prefix of the MemoryId (`global/…`,
+`team:<team_id>/…`, `user/…`). Reading or touching by id is
+membership-checked: `MemoryStore.get(id, token)` and
+`touch(id, token, used_at)` succeed only if the id's layer is in the
+caller's chain (global always; `team:T` needs T in `groups` and
+`use-team-memory`; `user` needs the memory's owner == subject), else
+`NotFound`. `expand_links` (§10d) and citation touches apply the same
+check, so an echoed marker cannot probe another team's store.
 
 ```
 on assistant_message(text):
@@ -1852,14 +1939,14 @@ which memories influenced which answer.
 ### 10f. Explicit search and writes over the API
 
 ```
-GET /memories?q=nightly&kinds=project&layers=team-a,personal&k=20&include_superseded=false
+GET /memories?q=nightly&kinds=project&layers=team:team-a,user&k=20&include_superseded=false
 
 ApiLayer.search_memories(request):
   token = validate(...)
   ctx   = TurnContext.lightweight(token, session=None)       # no session: active_team absent, pinned excluded
-  chain = layers.chain_for(token)
+  chain = layers.chain_for(token, session=None)              # no session layer in a session-less context
   results = concurrent(MemorySearchStep(layer).fetch(ctx) for layer in chain if layer in request.layers)
-  fused   = MemoryMergeStep.merge(results)
+  fused   = MemoryMerge.merge(results)
   return fused[:request.k]                                   # no RecallPolicy: this is a browser, not a prompt
 ```
 
@@ -1870,8 +1957,8 @@ ApiLayer.create_memory(request):
   c = MemoryCandidate.from_request(request, confidence=1.0, source="explicit")
   c = prefilter(ctx, [c])                                    # locked restrictive mining rules still apply (no credentials)
   if not c: return 422
-  route(ctx, c[0], explicit=True)                            # explicit=True is a positive signal for team routing:
-                                                             # the user typed it and named the team; no confirm needed
+  c[0].explicit = True                                       # a candidate flag: a positive signal for team routing;
+  route(ctx, c[0])                                           # the user typed it and named the team; no confirm needed
   return 201 { memory_id, layer }
 ```
 
@@ -1893,9 +1980,9 @@ Resolved by the flow above:
 
 ```
 context_ready            memories: global 0 (22ms) · team-a 3 (210ms) · user 2+1 pinned (6ms) · fused 6 · recalled 5
-memory_recalled          [m:user/pin-1, m:user/04, m:team-a/17, m:user/09, m:team-a/22]     (debug-level)
+memory_recalled          [m:user/pin-1, m:user/04, m:team:team-a/17, m:user/09, m:team:team-a/22]     (debug-level)
 assistant_delta ...
-assistant_message        citations=[m:team-a/17, m:user/04]
+assistant_message        citations=[m:team:team-a/17, m:user/04]
 ```
 
 ## 11. Session lifecycle and reconnect
@@ -1918,7 +2005,8 @@ subscribers to fan out to; reconnect means *replacing* its one stream.
                                     DELETE /sessions/{id}  or  POST /sessions/{id}/end
 Session {
   id, owner (sub), token (claims + encrypted raw), created_at, last_seen_at
-  state:       created | active | idle | ended
+  state:       created | active | idle | exhausted | ended
+  frozen:      bool                      # persisted; POST /sessions/{id}/freeze (§11e)
   turn:        { id, state: idle | running | awaiting_approval | cancelling, started_at }
   active_team, client_kind, client_tools
   conversation: Conversation
@@ -2026,9 +2114,14 @@ sweeper (every minute):
       end_session(session, reason="idle")
 
 POST /sessions/{id}/end     or     DELETE /sessions/{id}
-  -> end_session(session, reason="client")             # DELETE also skips retention: purge immediately after end
+  -> end_session(session, reason="client", purge=True)  # DELETE: same reason, purge immediately after end
 
-end_session(session, reason):
+POST /sessions/{id}/freeze { frozen: bool }            # owner, or a read-audit-all holder
+  if frozen and session.turn.state != idle: cancel_turn(session)   # a frozen session may not run
+  session.frozen = frozen; sessions.save(session); audit.write(kind=freeze, ...)
+  # while frozen every POST /messages is refused with 409 { error: frozen }; the on_message GateStep is the belt to this brace
+
+end_session(session, reason, purge=False):
   if session.turn.state in (running, awaiting_approval):
       cancel_turn(session)                                          # pending approvals -> Deny("session ended")
   await drain(session)                                              # running mining jobs finish
@@ -2036,14 +2129,16 @@ end_session(session, reason):
   # 1. mine what is left, if the token still works
   if session.unmined_turns and session.token.valid():
       MiningJob(session, turns=session.take_unmined_turns()).run_now()
-  else: audit_log.write(session, "unmined turns dropped", count=len(session.unmined_turns))
+  else: audit.write(session, kind=memory, outcome="unmined turns dropped", count=len(session.unmined_turns))
 
   # 2. optional session-summary memory (config.sessions.summary: off | personal | routed)
   if config.sessions.summary != off and session.conversation.turns >= config.sessions.summary_min_turns and session.token.valid():
       c = miner.summarise(session)                                    # kind=episodic, body="what was worked on / decided / left open"
       c.audience = team:session.active_team if (config.sessions.summary == routed and session.active_team) else personal
       c.tags += ["session-summary", session.id]
-      route(TurnContext.from_session(session), c)                    # normal on_memory_candidate chain; may downgrade to personal
+      ctx = TurnContext.from_session(session)                        # provenance.teams = every team layer whose memories or skills
+      c.provenance = ctx.provenance                                  #   were used in this session (drives the cross-team check, §6d)
+      route(ctx, c)                                                  # normal on_memory_candidate chain; may downgrade to the user layer
 
   # 3. retention
   session.state = ended; session.ended_at = now(); session.stream?.send(session_ended, reason); session.stream?.close()
@@ -2066,8 +2161,11 @@ persisted:   id, owner, token claims + raw token encrypted at rest (needed to mi
              state, turn, active_team, client_kind, client_tools, client gates (session.rules incl. remembered
              approvals), instructions, scratch memories, loaded_skills (ids + pinned versions; tools/fragments
              re-read from the store on load), pending_client_calls (with deadlines), pending_job_results,
-             conversation, events (bounded), approvals, unmined_turns, unmined_candidates, mined_turns, timestamps
+             conversation, events (bounded), tool approvals (memory approvals live in the owner-scoped ApprovalStore),
+             unmined_turns, unmined_candidates, mined_turns, frozen, timestamps
 not persisted: chain (rebuilt from token + config on load), stream, ctx of a running turn, the per-call audit state
+schema:      every store adapter records a schema_version; migrate_on_start: true runs the adapter's migrations at boot;
+             a store whose version is newer than the service refuses to open (config_invalid)
 ```
 
 ```
@@ -2076,6 +2174,7 @@ on service start:
       session.turn.state = idle
       session.events.append(turn_interrupted, turn_id, reason="service restart")  # client sees it on reconnect
       for a in session.approvals.pending(kind=tool): a.answer(Deny("service restart"))   # memory approvals keep their long window (§5g)
+      for c in session.pending_client_calls.values(): c.answer(ToolResult.error(kind=interrupted, "service restart"))   # then cleared
       session.unmined_turns.append(turn_id)                                         # the turn's completed part still gets mined
   sessions.save_all()
 # sessions load lazily on first request; the chain is rebuilt then.
@@ -2144,7 +2243,7 @@ Idle end with summary:
 ```
   (stream closed 30 min ago)                    sweeper: end_session(idle)
                                                 mining job: 1 unmined turn -> memory_created (logged, no stream)
-                                                summary -> on_memory_candidate -> personal (no active_team) -> memory_created
+                                                summary -> on_memory_candidate -> user layer (no active_team) -> memory_created
                                                 session_ended (logged; delivered on a later replay if the client ever reconnects)
 ```
 
@@ -2179,6 +2278,8 @@ tools:
     session:  []                                 # client tools run on the client; nothing server-side
   sandbox:
     policy_by_layer: { global: strict, team: strict, user: relaxed }   # every script impl is sandboxed; only the policy varies
+    # strict:  no host binds except the per-call workspace; empty env; network only via the egress proxy allowlist
+    # relaxed: adds a read-only bind of ${user_root} and PATH/HOME in env; same network rule; still its own uid/namespaces
     kind: subprocess_restricted                  # v1; adapter registry: subprocess_restricted | container | wasm
   runtimes: { python: /usr/bin/python3, node: /usr/bin/node, sh: /bin/sh }   # allowlist; a script names one
   limits:   { wall_s: 60, cpu_s: 30, mem_mb: 512, pids: 64, stdout_kb: 256, result_kb: 64 }
@@ -2315,7 +2416,9 @@ isolation for team-layer scripts than for user-layer ones.
 CapabilityCheckedRunner.start(d, args, ctx):
   # static: the definition was clipped at registration; re-check in case the ceiling config changed since
   if not covers(ceiling[d.layer], d.granted): return ToolResult.error("tool exceeds layer ceiling", kind="capability")
-  # dynamic: args that name paths or hosts must fall inside the grant
+  # dynamic: args that name paths or hosts must fall inside the grant. Recognition is by schema annotation ONLY:
+  #   a property with "x-arg-kind": "path" | "host" | "url" in the tool's input_schema. No heuristics on names or values.
+  #   A tool whose string args are unannotated cannot be path- or host-restricted (and client gates' path_args_* skip it).
   for p in paths_in(args, d.input_schema):   if not d.granted.fs_read.matches(p) and not d.granted.fs_write.matches(p): return error(f"path not permitted: {p}", kind="capability")
   for h in hosts_in(args, d.input_schema):   if not d.granted.network.matches(h): return error(f"host not permitted: {h}", kind="capability")
   return self.inner.start(d, args, ctx)
@@ -2345,7 +2448,7 @@ line of defence, §6c).
 
 ```
 ToolResult {
-  ok: bool, kind?: invalid_args | capability | timeout | rate_limited | cancelled | job_limit | tool_error
+  ok: bool, kind?: invalid_args | capability | timeout | rate_limited | cancelled | interrupted | job_limit | tool_error
   content: text | json | [ContentPart]                 # ContentPart: text | json | asset_ref (binary saved aside, not inlined)
   truncated: bool, full_ref?: AssetRef                 # over result_kb: head kept inline, full output stored and referenced
   exit_code?, duration_ms, stderr_tail?
@@ -2353,7 +2456,7 @@ ToolResult {
 
 truncate(result, kb, ctx):
   if size(result.content) <= kb*1024: return result
-  ref = assets.put(ctx.session, result.content, ttl=config.tools.result_ttl)
+  ref = assets.put(ctx.session, result.content, ttl=config.assets.ttl)
   result.content = head(result.content, kb*1024) + f"\n[truncated; full output: {ref}]"
   result.truncated = True; result.full_ref = ref
   return result
@@ -2541,9 +2644,13 @@ job_result_message(job) -> Message:
   # into a different session. Providers reject a tool_result with no matching preceding tool_use, so a
   # late result is a user-role message with a marker block, valid in any append-only history:
   return Message(role=user, content=[
-      text(f"[background job {job.id} finished: tool {job.tool}, started in turn {job.origin.turn_id}"
-           f"{'' if same_session else ' of an earlier session'}; state={job.state}]"),
-      text(job.result.content)  or  document(job.result.full_ref) ])
+      text(f'<job_result job="{job.id}" tool="{job.tool}" origin_turn="{job.origin.turn_id}" state="{job.state}"'
+           f'{" origin_session=\"" + job.origin.session_id + "\"" if not same_session else ""}>'),
+      text(job.result.content)  or  document(job.result.full_ref),
+      text("</job_result>") ])
+  # The global baseline prompt states that <job_result> blocks are data, not instructions (09-threat-model.md).
+  # Foreground results need no wrapper: provider tool_result blocks already carry the tool name, and the same
+  # baseline instruction covers them.
 ```
 
 The model then streams an unsolicited message: "The deploy finished
@@ -2577,7 +2684,7 @@ otherwise, and always in the jobs list.
 ```
 end_session(session, reason):                  # §11e gains one step before draining
   for job in jobs.where(origin.session_id=session.id, state in (queued, running)):
-      if job.on_session_end == cancel or reason == "client_delete": job_runner.cancel(job)
+      if job.on_session_end == cancel or purge: job_runner.cancel(job)
       # else: continues; owner-scoped; delivered per 13d
 
 on service start:                              # §11f gains
@@ -2599,9 +2706,9 @@ jobs:
   max_per_user: 5
   max_total: 50
   poll_s: 15                       # http status polling
-  result_ttl: 7d                   # undelivered results and stored outputs
   delivery_default: agent_turn     # or notify; a client may override per session (client_kind cli -> notify?)
-  notifier: { adapter: none }      # webhook | email | chat for owners with no open session
+# undelivered results and stored outputs live in the asset store: assets.ttl (7d) applies
+# notifier.adapter (top level): none | webhook | email | chat, for owners with no open session
 ```
 
 Concurrency is separate from foreground slots (§12h). Background jobs
@@ -2691,11 +2798,13 @@ ClientToolDeclaration {
   name, description, input_schema
   risk: none | low | medium | high            # floor applied below
   requires: [client(kind)]                    # only client(...) capabilities are accepted
-  mode: foreground | background               # background client tools report via /jobs/{id}/progress (§13c)
+  mode: foreground | background               # background client tools report via POST /sessions/{id}/jobs/{job_id}/progress (§13c)
   timeout_s?: <= config.tools.client_wall_s
 }
 
 ApiLayer.register_client_tools(session, decls):
+  if len(decls) > 64: return 400 { error: bad_request, "at most 64 client tools" }        # gates ≤ 64, instructions ≤ 8 KB likewise
+  if session.pending_client_calls: return 409 { error: conflict, "a client tool call is pending" }
   defs = []
   for c in decls:
       if any(cap.kind != "client" for cap in c.requires): return 400 "client tools may only declare client(...) capabilities"
@@ -2707,7 +2816,7 @@ ApiLayer.register_client_tools(session, decls):
       defs.append(d)
   session.client_tools = defs; sessions.save(session); session.chain = layers.chain_for(session.token, session)   # rebuilds the session layer
   emit(session, client_tools_registered, [d.name for d in defs])
-  return 200 { registered: [...], shadows: [(d.name, lower_layer) for d in defs if d.name in lower_unlocked_names] }
+  return 200 { registered: [...], shadows: [(d.name, earlier_layer) for d in defs if d.name in earlier_unlocked_names] }
 ```
 
 At the next `on_message`:
@@ -2737,8 +2846,9 @@ POST /sessions/{id}/gates   [ ClientGate ]                 # replaces the set
 
 ClientGate = ClassifierRule with:
   role:   tool_audit
-  kind:   deny | require_approval                          # restrictive only; `allow` is accepted but unlocked, so it only pre-empts the model audit
+  kind:   deny | require_approval                          # restrictive only; an `allow` is rejected with 400 at registration
   match:  §8a fields  +  { path_args_within: "<dir>", path_args_not_within: "<dir>", host_args_in: [...] }
+                                                           # path/host args are recognised by the tool's x-arg-kind annotations only (§12e)
   locked: false (forced)
 
 # CLI example: nothing may touch files outside the working directory, whatever tool it is
@@ -2763,7 +2873,7 @@ SessionInstructionsStep.apply(ctx):
   ctx.put("prompt", "session-instructions", PromptFragment(section=session, body=session.instructions, priority=0), locked=False)
 
 # scratch: memories that must not outlive the session (e.g. "current PR is #4412")
-POST /memories { kind: scratch, body: "current PR is #4412" }     # audience is implicitly session
+POST /memories { kind: scratch, body: "current PR is #4412", audience: session }   # audience values: personal | team:<id> | session
 SessionScratchStep.fetch/apply -> ctx.memories += session.scratch  (rank fused like any other layer; layer=session)
 ScratchAcceptStep.run(ctx, c):  if c.kind == scratch: session.scratch.append(c); return Stop(Accepted)  else Continue
 # scratch is dropped at end_session; the miner may still propose a durable version of it as a normal candidate
@@ -2796,7 +2906,7 @@ on cancel:     pending client calls are dropped; a late tool-result POST returns
 ```
 
 A background client tool (`mode: background`) returns a job (§13) whose
-progress and result arrive via `/jobs/{id}/progress` and `/tool-results`
+progress and result arrive via `POST /sessions/{id}/jobs/{job_id}/progress` and `/tool-results`
 respectively; the same untrusted-input rules apply.
 
 ### 14f. What clients typically register
@@ -2857,7 +2967,7 @@ file or global unlocking `read_file`.
 
 ```
 client_tools_registered  [local.read_file, local.write_file, open_in_editor]
-tool_shadowed            (only if a client tool took an unlocked lower-layer name)
+tool_shadowed            (only if a client tool took an unlocked earlier-layer name)
 tool_call_proposed       open_in_editor  execute_on=client  state=execute  args={...}
 tool_call_finished       open_in_editor  ok
 tool_call_denied         local.read_file  by=session:cli-cwd-only
@@ -2956,7 +3066,7 @@ The assembler renders `ctx.skills` as the `__skills` derived fragment
 <skills>
 Load a skill with load_skill(name) to get its full instructions and tools.
 - nightly-triage (team-a) ▲suggested: Triage a failed nightly CI run… tools: fetch_log
-- code-review (personal, overrides global): Review a diff against team conventions. tools: lint
+- code-review (user, overrides global): Review a diff against team conventions. tools: lint
 - release-notes (global): Draft release notes from merged PRs.
 - deploy-checklist (team-a): Verify a deploy against the checklist. tools: verify
 </skills>
@@ -2979,8 +3089,11 @@ on_tool_call for load_skill("nightly-triage"):
   auditable by rule; the model audit is skipped unless a deployment removes the global allow.
 
 execute (BuiltinRunner -> HostApi.load_skill):
-HostApi.load_skill(name) -> ToolResult:
-  summary = ctx.skills.get(name) or return error("unknown skill; see the skill index")
+HostApi.load_skill(name_or_id) -> ToolResult:
+  if ":" in name_or_id:                                    # full id `<layer>:<name>`: load that layer's store directly (still audited)
+      layer, name = split(name_or_id); summary = layers.get(layer, ctx.token).skill_store.summary(name_or_id)
+  else: summary = ctx.skills.get(name_or_id)
+  if not summary: return error("unknown skill; see the skill index")
   if len(session.loaded_skills) >= config.skills.max_loaded: evict_lru(session)                 # emits skill_unloaded
   skill = layers.get(summary.layer, ctx.token).skill_store.load(summary.id)
   skill = clip_tools_to_ceiling(skill, summary.layer)                                             # §12a; on_excess hide|degrade
@@ -3044,6 +3157,20 @@ end_session         -> everything unloaded (nothing to do; session state goes aw
 ```
 skill_resource(skill, path, range?)   builtin, risk: low; requires: []    # reads from the skill's own store, not the host fs
   -> store.resource(id, path), size-capped (config.skills.resource_kb), redacted, returned as text or asset ref
+
+Builtin catalogue (all origin: source, layer global, impl builtin):
+| name            | risk   | requires              | one line                                                      |
+|-----------------|--------|-----------------------|---------------------------------------------------------------|
+| load_skill      | low    | –                     | load a skill by name or full id (§15d)                        |
+| unload_skill    | none   | –                     | unload a loaded skill                                         |
+| skill_resource  | low    | –                     | read a file from a skill's own store                          |
+| read_asset      | low    | –                     | page a stored asset: `range=bytes=start-end` (§12g)           |
+| memory_search   | low    | –                     | the recall path of §10 with the session token                 |
+| job_status / job_wait / job_cancel | low | –        | §13c; owner-checked                                           |
+| list_dir        | medium | fs_read               | list a directory inside the grant                             |
+| read_file       | low    | fs_read               | read a file inside the grant                                  |
+| shell           | high   | subprocess            | run a command through the sandbox (`HostApi.run`)             |
+(`ci_status` in the examples is an http tool from the global tool source, not a builtin.)
 Script tools of the skill get resources/ materialised read-only into their sandbox workspace (§12c), so
   tools/fetch_log.py can open ../resources/flaky.txt without any fs_read grant on the host.
 ```
@@ -3056,6 +3183,9 @@ instructions or tools until the model or user reloads.
 on source refresh:
   for ls in session.loaded_skills: if store.version(ls.id) != ls.version: emit(skill_outdated, ls.id, ls.version, now=...)
 load_skill(name) on an already-loaded, outdated skill -> reloads at the new version (tools re-put; old tool names removed)
+after a service restart: session.loaded_skills holds ids + pinned versions; tools and fragments are re-read with
+  store.load_version(id, version) where the store supports it, else store.load(id) at the current version with
+  skill_outdated emitted for that skill
 ```
 
 ### 15i. Discovery at scale
@@ -3101,7 +3231,10 @@ turn 3  model (or user via client) -> load_skill("nightly-triage") -> reloaded a
 GET  /skills?q=&layers=&k=                 discovery across permitted layers (summaries; suggested/pinned flags need no session)
 GET  /skills/{id}                          full skill (instructions, tools, fragments, version, derived_from)
 GET  /skills/{id}/resources/{path}         a resource file (size-capped)
-POST /sessions/{id}/skills/{name}/load     client-initiated load (same path as load_skill; audited as a tool call)
+POST /sessions/{id}/skills/{name}/load     client-initiated load: a "system turn" (below); 409 turn_in_progress if a turn is running
+  system turn: emit(turn_started, initiated_by=client); run on_message (no model call); run on_tool_call for a synthetic
+               load_skill(name) call (so rules and the audit apply exactly as for a model-initiated load); execute it;
+               emit(turn_complete, outcome=ok). The next real turn re-puts the loaded skill from session.loaded_skills.
 DELETE /sessions/{id}/skills/{name}        unload
 GET  /sessions/{id}/skills                 loaded skills with versions and outdated flags
 
@@ -3109,6 +3242,21 @@ events: skill_suggested (debug), skill_loaded {auto?}, skill_unloaded {reason: m
 ```
 
 ## 16. Classifier engine and model client adapters
+
+HTTP source adapters share one wire contract, so a team can back any
+layer with a small service:
+
+| Adapter          | Request                                              | Response            |
+|------------------|------------------------------------------------------|---------------------|
+| HttpSkillStore   | `GET {base}/skills?q=&k=` · `GET {base}/skills/{id}` · `GET {base}/skills/{id}/resources/{path}` · `GET {base}/skills/{id}/versions/{v}` | `[SkillSummary]` · `Skill` · bytes · `Skill` |
+| HttpMemoryStore  | `POST {base}/memories/search {query, k, kinds}` · `GET/PUT/DELETE {base}/memories/{id}` · `POST {base}/memories` | `[ScoredMemory]` · `Memory` · … |
+| HttpRuleSource   | `GET {base}/rules`                                   | `[ClassifierRule]`  |
+| HttpToolSource   | `GET {base}/tools`                                   | `[ToolDefinition]`  |
+| HttpPromptSource | `GET {base}/prompt`                                  | `[PromptFragment]`  |
+
+Every request carries `Authorization: Bearer <service token>` and
+`X-Subject: <sub>` (so a user-layer service can key on the subject);
+responses carry `ETag`, which the adapter uses as the item `version`.
 
 Two ports sit at the bottom of everything: `ModelClient` (one provider
 behind one interface) and `ClassifierEngine` (the support agent's brain,
@@ -3163,8 +3311,8 @@ render(ctx) -> ModelRequest:
   # schema_is_strict_safe(s): every object has additionalProperties=false and a `required` list, and no keyword outside the
   #   provider's supported subset (no numeric/string constraints, no recursion); otherwise strict=false and args are validated locally
             for d in ctx.tools.values() in sorted-by-name order]   # deterministic order: a reordered tool list is a cache miss
-  return ModelRequest(model=config.model.agent, system=system, messages=ctx.session.conversation.messages,
-                      tools=tools, max_output=config.model.max_output, effort=config.model.effort,
+  return ModelRequest(model=config.model.agent.model, system=system, messages=ctx.session.conversation.messages,
+                      tools=tools, max_output=config.model.agent.max_output, effort=config.model.agent.effort,
                       parallel_tools=True, metadata={..., purpose: agent})
 ```
 
@@ -3191,7 +3339,7 @@ Conversation rules the core keeps so any adapter can cache and replay:
 
   ```
   before model.complete(req):
-    need = model.count_tokens(req) + req.max_output
+    need = (model.count_tokens(req) or estimate(req)) + req.max_output   # count_tokens failure -> len(text)/4 estimate, logged; never fails the turn
     if need <= caps.context_window - config.context.reserve: proceed
     elif caps.compaction and config.context.overflow == provider_compaction:
         req.compaction = enabled                                    # adapter passes the provider's server-side compaction; blocks returned are stored verbatim like any provider_opaque block
@@ -3217,7 +3365,7 @@ AnthropicModelClient(config):
     body = {
       model: req.model,                                       # e.g. "claude-opus-5" (config; exact id, no date suffix)
       max_tokens: req.max_output,
-      system: [ {type: text, text: b.text, cache_control: {type: ephemeral, ttl: config.cache.ttl}} if b is the LAST stable block
+      system: [ {type: text, text: b.text, cache_control: {type: ephemeral, ttl: config.model.cache.ttl}} if b is the LAST stable block
                 else {type: text, text: b.text}   for b in req.system ],
       tools: [ {name, description, input_schema, strict: t.strict} for t in req.tools ],      # tools render before system: both cached by that breakpoint
       tool_choice: {type: auto},                              # never forced: unsupported on Claude Fable 5.1; strict:true keeps args valid
@@ -3226,7 +3374,7 @@ AnthropicModelClient(config):
       output_config: { effort: req.effort } + ({ format: {type: json_schema, schema: req.structured} } if req.structured),
       stream: true,
     }
-    if config.model.fallbacks: body.fallbacks = "default"; betas += ["server-side-fallback-2026-07-01"]   # opt-in refusal fallback
+    if config.model.agent.fallbacks: body.fallbacks = "default"; betas += ["server-side-fallback-2026-07-01"]   # opt-in refusal fallback
 
     with client.messages.stream(**body) as stream:
       for ev in stream:                                       # wire events -> ModelEvent
@@ -3237,7 +3385,7 @@ AnthropicModelClient(config):
           content_block_delta:  match ev.delta.type:
                                   text_delta:       yield text_delta(ev.delta.text)
                                   input_json_delta: buf[index] += ev.delta.partial_json; yield tool_call_args_delta(id, ev.delta.partial_json)
-                                  thinking_delta:   yield reasoning_delta(...) if config.model.show_reasoning  # display: summarized
+                                  thinking_delta:   yield reasoning_delta(...) if config.model.agent.show_reasoning  # display: summarized
           content_block_stop:   if index in buf: yield tool_call_end(id, json.loads(buf[index]))
           message_delta:        stop = ev.delta.stop_reason; usage = ev.usage
           message_stop:         final = stream.get_final_message()
@@ -3322,7 +3470,7 @@ audit(inp):
       out = AuditOutput.parse(ev.text)                                      # schema-valid by construction when structured_output is supported
   except deadline_exceeded, error{retryable}:                               # after SDK retries
       out = AuditOutput.undecided(reason="classifier unavailable")
-  audit_log.write(inp.call, out, model=req.model, usage=ev.usage)
+  audit.write(inp.call, out, model=req.model, usage=ev.usage)
   return out
 
 AUDIT_OUTPUT_SCHEMA = { type: object, additionalProperties: false,
@@ -3558,12 +3706,16 @@ the owner, or go out of band; they are never dropped silently.
 ```
 Listener { on_event(e) }                          # enqueue only; a worker drains the queue
 
-MetricsListener:   counts and latencies per type; per-layer timings from context_ready; cache hit rates from turn_complete.usage
-AuditLogListener:  persists tool_call_*, audit_verdict, approval_*, memory_*, skill_loaded, shadow_refused, chain_rebuilt
-                   to the audit store (queryable via GET /classifier/verdicts and friends)
+MetricsListener:   counts and latencies per type; per-layer timings from context_ready; cache hit rates from turn_complete.usage;
+                   exported at GET /metrics (Prometheus text; no auth on loopback, read-audit-all otherwise)
+AuditLogListener:  turns tool_call_*, audit_verdict, approval_*, memory_*, skill_loaded, shadow_refused, chain_rebuilt, turn_flagged
+                   into AuditRecords via audit.write(...) — the single writer path; queryable via GET /audit and GET /classifier/verdicts
 NotifierListener:  tool_job_finished / memory_confirm for owners whose session has no open stream -> notifier adapter (13d)
-WebhookListener:   deployment-configured: POST selected event types to a URL (e.g. turn_complete for billing)
+WebhookListener:   config `webhooks: [{url, events: [...]}]`: POST selected event types to a URL (e.g. turn_complete for billing)
 ```
+
+Logs are structured JSON with `session_id`, `turn_id`, and `subject_hash`
+on every line; `GET /health` returns `{status, stores: {name: ok|degraded}, version}`.
 
 Listeners never block `publish`; a slow listener falls behind on its own
 queue and is reported, not the client.
@@ -3659,7 +3811,7 @@ reconnect later with Last-Event-ID: 41
 - Static audit rules split by direction like mining rules: `deny` and
   `require_approval` accumulate across layers and no layer can remove
   another's; `allow` acts at its own layer and yields to any restriction
-  unless it is locked, in which case it shields the call from lower
+  unless it is locked, in which case it shields the call from later
   layers. Peer-team conflicts therefore need no merge strategy.
 - Risk escalation by tool layer and the scope gates run before any
   layer's rules and cannot be configured away by a layer.
@@ -3739,7 +3891,7 @@ reconnect later with Last-Event-ID: 41
 - The global layer is always in the chain as the policy baseline; only
   its skills, tools, and memories need a scope. Restrictive mining rules
   run once before routing. The global `load_skill` allow is unlocked so
-  lower-layer restrictions still fire. Late job results are user-role
+  later-layer restrictions still fire. Late job results are user-role
   marker messages. Context overflow ends the session via
   `context_exhausted` unless provider compaction is on. User-layer paths
   are templated on `${user_root}` per subject (`decisions/0010`).

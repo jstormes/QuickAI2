@@ -55,25 +55,28 @@ TurnContext {
   inbound: UserMessage            # the message that started this turn
   # accumulators, start empty, filled by on_message steps in order:
   prompt:   {fragment_id -> PromptFragment}     # locked ids are final
-  skills:   {name -> Skill}                     # locked names are final
+  skills:   {name -> SkillSummary}              # locked names are final; full Skill bodies live in session.loaded_skills
   tools:    {name -> ToolDefinition}            # locked names are final
   rules:    [ClassifierRule]                    # in layer order; each layer's step reads its own
   memories: [ScoredMemory]                      # from every layer, merged later
   # filled after the model call:
   model_output: AssistantMessage | ToolCall[]
-  verdicts:  {tool_call_id -> Verdict}
+  audit:     {tool_call_id -> AuditState}       # decided, shielded, verdict, asked_by, trace
   candidates: [MemoryCandidate]
 }
 
 Step {
-  kind: gating | contributing                   # declared by the class; drives the default fail mode
+  kind: gating | contributing | consuming       # declared by the class; drives the default fail mode
   run(ctx, hook_payload) -> Continue | Stop(Action)
 }
 ContributingStep(Step) {                        # the common case
   fetch(ctx, payload) -> result                 # I/O; may run concurrently across layers
   apply(ctx, result)                            # pure; applied in chain order; uses ctx.put
 }
-# gating -> fail closed; contributing -> fail open; `required: true` on a contributing step fails the turn instead
+# consuming: only in on_memory_candidate (RouteToTeamStep, RouteToPersonalStep, ScratchAcceptStep);
+#            may return Stop(Accepted | Discarded | RequireApproval); fail-open (logs, emits
+#            memory_discarded(reason=store_error), queues the candidate on session.unmined_candidates, Continue)
+# gating -> fail closed; contributing/consuming -> fail open; `required: true` on a contributing step fails the turn instead
 Layer {
   name: text
   hooks: {hook_name -> [Step]}                  # the inner chains
@@ -137,13 +140,14 @@ the chain has:
   Locking is the only way an earlier layer constrains a later one's
   contributions.
 
-Two rules keep the chain honest:
+Three rules keep the chain honest:
 
-1. **Only gating stops the chain.** A contributing step never returns
-   `Stop`. A `Stop` in `on_message` prevents the model from running at
-   all; in `on_tool_call` it prevents that call; in `on_memory_candidate`
-   it discards that candidate. Steps must not stop merely because they
-   have nothing to add.
+1. **Only gating and consuming steps stop the chain.** A contributing
+   step never returns `Stop`. A gating `Stop` in `on_message` prevents the
+   model from running at all; in `on_tool_call` it prevents that call. A
+   consuming `Stop` in `on_memory_candidate` consumes that candidate
+   (accepted into a store, or discarded) and ends only that candidate's
+   hook. Steps must not stop merely because they have nothing to add.
 2. **Steps never talk to each other.** They communicate only through the
    context. A step may read what earlier layers or earlier steps
    contributed but holds no reference to other steps or layers.
@@ -167,7 +171,7 @@ directory store. The standard set:
 | Tools            | put tool definitions into `ctx.tools` by name; skip locked; loaded skills add `<skill>.<tool>` | –                                     |
 | Classifier rules | append this layer's rules to `ctx.rules`                         | apply this layer's `tool_audit` rules to each tool call (restrictions accumulate, locked allow shields). Restrictive `memory_mining` rules (drop/threshold/redact/disable) from every layer run once, before routing; widening ones (retag, auto-accept) run in this layer's `on_memory_candidate` step |
 | Memories         | append search results to `ctx.memories`                          | accept or decline `ctx.candidates` for this layer's store (routing policy) |
-| Gating           | static deny/allow/require-approval on the *message* (rate limit, content policy, session frozen) | static deny/allow/require-approval on *tool calls*; final say on memory writes |
+| Gating           | static deny/allow/require-approval on the *message* (rate limit, content policy, session frozen) | static deny/allow/require-approval on *tool calls* |
 
 Notes:
 
@@ -205,17 +209,19 @@ Notes:
 
 Steps append; the core merges just before rendering:
 
-- `ctx.prompt` → `PromptAssembler` groups by section, orders by priority,
-  applies the token budget (drop `optional` first, never drop `locked`),
-  renders with the deployment's `RenderStrategy`.
-- `ctx.memories` → `MergeStrategy` (reciprocal rank fusion by default,
+- `ctx.prompt` → `PromptAssembler.assemble(ctx, budget)` groups by
+  section, orders by priority, applies the token budget (drop `optional`
+  first, never drop `locked`), renders with the deployment's
+  `RenderStrategy`, and returns an `AssembledPrompt`.
+- `ctx.memories` → `MemoryMerge` (reciprocal rank fusion by default,
   layer boost optional) then `RecallPolicy` for count and budget.
 - `ctx.skills` and `ctx.tools` → the tool list sent to the model:
   summaries of every skill plus every tool definition, already deduped by
   name through last-write-wins and locking.
 
-These merge steps are strategies, not steps in a layer, because they have no
-layer: they operate on what all layers contributed.
+This merge stage is a set of strategies invoked by the core, not steps in
+a layer, because it has no layer: it operates on what all layers
+contributed.
 
 ## Execution model: chain order is merge order, not execution order
 
@@ -280,8 +286,10 @@ nothing there.
 ```yaml
 layers:                                  # order = outer chain = trust order
   - name: global
+    allowed_sections: [identity, policy, project, skills, tools, user_prefs, memories, session]
+    may_lock: true
     on_message:
-      - gate:     { adapter: rate_limit, per_subject: 60/min }
+      - gate:     {}                     # the standard GateStep; reads config.gate.* and messages.rate
       - prompts:  { adapter: file, path: /etc/agent/global-prompt.md }
       - skills:   { adapter: git, url: git@github.com:org/shared-skills.git }
       - skills:   { adapter: git, url: git@github.com:org/legacy-skills.git }   # two sources, two steps
@@ -291,8 +299,10 @@ layers:                                  # order = outer chain = trust order
     on_tool_call:
       - static_rules: {}                 # evaluates rules this layer loaded
     on_turn_end:
-      - audit_log: { adapter: http, url: https://audit.example.internal }
+      - flag: { adapter: file, path: /etc/agent/flag-rules.yaml }   # optional post-hoc turn_flagged rules; audit persistence is the service's AuditLogListener
   - name: team                           # one outer entry per team id in the token
+    allowed_sections: [project, skills, tools]
+    may_lock: false
     on_message:
       - skills:   { adapter: git, url: git@github.com:org/team-{team_id}-skills.git }
       - memories: { adapter: http, url: https://memory.example.internal/teams/{team_id}, writable: true }
@@ -302,6 +312,7 @@ layers:                                  # order = outer chain = trust order
     on_memory_candidate:
       - route_to_team: {}                # accepts with positive signal only
   - name: user                           # templated per subject: ${user_root} = <users_root>/<token.sub>
+    allowed_sections: [project, user_prefs]
     on_message:                          # (single-user dev mode may set users_root to ~/.agent and a fixed subject)
       - prompts:  { adapter: file, path: "${user_root}/prompt.md" }
       - skills:   { adapter: directory, path: "${user_root}/skills" }
@@ -315,7 +326,9 @@ layers:                                  # order = outer chain = trust order
   - name: session                        # built in: client tools, active_team, ad-hoc instructions
 ```
 
-A solo deployment can list only `user` and `session`.
+`global` and `session` are always present. A solo deployment lists
+`global` (builtin tool source and the framework's default prompt
+fragments only), `user`, and `session`.
 
 ## Why this shape
 

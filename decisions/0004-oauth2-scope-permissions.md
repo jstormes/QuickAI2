@@ -1,6 +1,7 @@
 # 0004 – OAuth2-style authentication with scope-based permissions
 
-**Status:** accepted (2026-09-14)
+**Status:** accepted (2026-09-14). **Amended by 0010/0011**: the starting
+set is now fourteen permissions (`04-auth-and-permissions.md`).
 
 ## Context
 

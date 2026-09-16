@@ -15,6 +15,13 @@
 - Every API request carries `Authorization: Bearer <token>`. Session
   creation binds the session to the token's subject; later requests on
   that session must present a token for the same subject.
+- Validation config (full reference in `02-layering-and-composition.md`):
+  `api.auth.jwks_url` or `introspection_url`, `clock_skew_s` (60),
+  `scope_claim_format: space | array`, `groups_claim` (`groups`), and
+  `dev_idp: {subject, scopes[], groups[]}` for single-user mode. A missing
+  or invalid bearer is 401 `unauthorized`; an expired one is 401
+  `token_expired`. A `dev_idp` outside single-user mode is a startup
+  warning.
 
 ## Authorization: permission scopes
 
@@ -23,9 +30,13 @@ set of permission strings, and the API and stores check them.
 
 ### Terminology
 
-OAuth2 calls permissions "scopes". To avoid confusion with the framework's
-*layer* concept, prose in this design says **permission** for an OAuth2
-scope string such as `use-global-skill`; code calls the set `scopes`.
+OAuth2 calls permissions "scopes". In this design **permission** and
+**scope** are synonyms for an OAuth2 scope string such as
+`use-global-skill`; code calls the set `scopes`. The only other use of
+the word is `remember_match` on approvals (formerly `remember_scope`),
+which is unrelated. A **capability** is a tool grant
+(`ToolDefinition.requires` / `granted`, `Skill.capabilities`), never an
+OAuth scope.
 
 There is no separate identity object. The validated **access token**
 (`sub`, `scope`, `groups` claims) is passed through the system as-is;
@@ -104,7 +115,7 @@ Notes on the starting set:
 | `use-<layer>-prompt`      | include that layer's prompt fragments (global always on) |
 | `create-<layer>-prompt`   | write prompt fragments to that layer via the API         |
 | `use-<layer>-classifier-rule`    | apply that layer's classifier rules (global always on) |
-| `create-<layer>-classifier-rule` | write classifier rules to that layer via the API |
+| `create-<layer>-classifier-rule` | write classifier rules to that layer via the API. **Open decision, but required:** the walkthrough's rule authoring (§8g) and remembered approvals (§5e) depend on `create-personal-classifier-rule` existing |
 | `use-<layer>-tool`        | include that layer's tools in the session's registry     |
 | `create-<layer>-tool`     | write tool definitions to that layer via the API         |
 
@@ -117,8 +128,12 @@ later maybe `manage`. Ten of the fourteen starting permissions follow it;
 ## Audit records
 
 Everything security-relevant is written to the audit store as one record
-shape, by `AuditLogListener` (events) and by direct `audit_log.write`
-calls in the classifier and runners:
+shape through one path: the service-level `AuditStore` port
+(`write(AuditRecord)`, `query(filter, token)`, `retention`;
+`01-core-abstractions.md`). `AuditLogListener` writes records for events,
+and the classifier and runners call `audit.write(...)` directly; there is
+no per-layer audit step and no second writer. `AccessToken.raw` is never
+written to it.
 
 ```
 AuditRecord {
@@ -146,6 +161,22 @@ request --> API layer: token valid? subject matches session?
         --> Tool dispatcher: execution permissions checked per tool
         --> Classifier: may consult permissions (e.g. bypass-tool-audit)
 ```
+
+Two rules that fall out of the chain but are easy to miss:
+
+- **Membership for memory ids.** `MemoryStore.get(id, token)` and
+  `touch(id, token, used_at)` require the id's layer prefix to be a layer
+  in the caller's chain: `global` always; `team:T` needs T in `groups`
+  and `use-team-memory`; `user` needs the memory's owner to equal `sub`.
+  Anything else is `NotFound`, never `Forbidden`. Link expansion and
+  citation touches apply the same rule.
+- **`allows_any(layer)`** counts both `use-` and `create-` scopes for
+  the layer, so a token with only `create-personal-memory` still gets a
+  user layer (with no read steps) and mining can write.
+- **Model audit floor.** An unlocked `allow` from a later layer skips the
+  model audit only below `classifier.always_audit_risk_gte` (default
+  `high`); at or above it the call is model-audited anyway. A locked
+  allow still skips. See `08-walkthrough.md` §8b and decision 0012.
 
 Key point: **stores see the validated token object, never the raw
 bearer header, and never validate anything themselves.** They only read

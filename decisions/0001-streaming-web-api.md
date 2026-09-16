@@ -1,6 +1,7 @@
 # 0001 – The framework presents itself as a streaming web API
 
-**Status:** accepted (2026-09-14)
+**Status:** accepted (2026-09-14). **Amended by 0010/0011**: WebSocket is
+resolved as an optional transport adapter beside SSE (`08-walkthrough.md` §17e).
 
 ## Context
 

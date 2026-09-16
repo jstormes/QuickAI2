@@ -25,25 +25,29 @@ GET    /sessions/{id}                     metadata, state, turn state, token sub
 POST   /sessions/{id}/end                 end now (drain mining, optional summary memory, retention applies)
 DELETE /sessions/{id}                     end and purge immediately
 
-POST   /sessions/{id}/messages            send user_message; returns turn_id (409 turn_in_progress while a turn runs; 409 context_exhausted with
-                                          resume_with once the conversation no longer fits the model's window). ?wait=true blocks until
-                                          turn_complete, or returns 202 with the pending state if the turn parks on an approval or client call.
-                                          Optional Idempotency-Key header: a repeat within 24 h returns the original response.
+POST   /sessions/{id}/messages            send user_message; returns turn_id (409 turn_in_progress while a turn runs unless messages.queue=queue_one,
+                                          which holds at most one queued message and 409s the second; 409 context_exhausted with resume_with once the
+                                          conversation no longer fits the model's window; 409 frozen). ?wait=true blocks until turn_complete or for at
+                                          most api.wait_max_s (30 s), then returns 202 with the pending state (also when the turn parks on an approval
+                                          or client call). Optional Idempotency-Key header: a repeat within idempotency.ttl (24 h) returns the original
+                                          response; the same key with a different body is 422 unprocessable.
 GET    /sessions/{id}/events?level=       stream (SSE) of outbound events; id=seq, event=type, heartbeat comments; level=info|debug
 GET    /sessions/{id}/ws                  optional WebSocket: same events out, POST-equivalent frames in (08-walkthrough.md §17e)
 POST   /sessions/{id}/tool-results        client-executed tool result { tool_call_id, ok, content }; untrusted, capped, redacted; Idempotency-Key supported
-GET    /sessions/{id}/assets/{ref}?range=  full output of a truncated tool result (also reachable by the model via read_asset)
+GET    /sessions/{id}/assets/{ref}?range=bytes=start-end   full output of a truncated tool result (also reachable by the model via read_asset)
 POST   /sessions/{id}/jobs/{job_id}/progress   client-executed background tool reports progress (owner check; the job's origin session must be this session)
 GET    /jobs?state=&delivered=            the caller's background jobs across sessions
 GET    /jobs/{id}                         state, progress, result if finished, origin (owner check)
 POST   /jobs/{id}/cancel                  (owner check)
-POST   /sessions/{id}/approvals/{aid}     answer an approval_requested { decision, remember?, note? }
-GET    /sessions/{id}/approvals?state=pending&kind=tool|memory   outstanding requests (for reconnect)
+POST   /sessions/{id}/approvals/{aid}     answer an approval_requested { decision, remember?: once | session, note? }
+GET    /sessions/{id}/approvals?state=pending&kind=tool|memory   outstanding requests for this session (for reconnect)
+GET    /approvals?state=pending&kind=     owner-scoped: every pending request of the caller across sessions (memory approvals outlive their session)
+POST   /approvals/{aid}                   owner-scoped answer; same body as the session form
 POST   /sessions/{id}/cancel
 
-GET    /memories?q=&kinds=&tags=&layers=&k=&include_superseded=   search across permitted layers; rank-fused, no recall policy
+GET    /memories?q=&kinds=&tags=&layers=global,team:team-a,user&k=&include_superseded=   search across permitted layers; rank-fused, no recall policy
 GET    /memories?suggested_for=team:T     personal memories the miner suggested for team T
-GET    /memories/{id}
+GET    /memories/{id}                     id carries its layer prefix; NotFound unless the layer is in the caller's chain (membership rule, 04)
 POST   /memories/{id}/promote?layer=team:T copy a personal memory into a team layer (provenance kept)
 POST   /memories                          explicit write (respects layer rules)
 DELETE /memories/{id}
@@ -65,7 +69,7 @@ POST   /skills/{id}/rebase                re-merge the fork onto the current bas
 GET    /sessions/{id}/tools               tools currently registered in a session, with layer + source
 POST   /sessions/{id}/tools               replace the client's tool declarations (client(...) capabilities only; execute_on forced to client)
 DELETE /sessions/{id}/tools/{name}
-POST   /sessions/{id}/gates               replace the client's declarative gates (restrictive rules, unlocked, evaluated last)
+POST   /sessions/{id}/gates               replace the client's declarative gates (deny | require_approval only, unlocked, evaluated last; an `allow` is 400 bad_request)
 GET    /tools?layer=...                   tool definitions available from a layer
 POST   /tools                             write a tool definition to a layer (needs create-* permission)
 DELETE /tools/{id}
@@ -80,10 +84,11 @@ DELETE /classifier/rules/{id}
 GET    /classifier/verdicts?session=&dry_run=   audit log of verdicts (read-audit for own sessions; read-audit-all for any); dry_run=true lists what dry-run rules would have stopped
 POST   /sources/refresh                   ask every layer's sources to reload
 POST   /sessions/{id}/assets              upload an attachment (owner-checked, size-capped) -> {asset_ref}
-POST   /sessions/{id}/freeze              freeze/unfreeze a session (owner, or read-audit-all holder); frozen sessions deny every message
+POST   /sessions/{id}/freeze              { frozen: bool } (owner, or read-audit-all holder); freezing cancels a running turn; frozen sessions 409 every message
+GET    /metrics                           Prometheus text; no auth on loopback, read-audit-all otherwise
 GET    /audit?session=&owner=&kind=&since=  audit records (own sessions with read-audit; any owner with read-audit-all)
 GET    /config/effective                  the validated, defaulted configuration (manage-sources)
-GET    /health
+GET    /health                            { status: ok | degraded, stores: { <name>: ok | degraded }, version }
 ```
 
 SSE is the default. WebSocket at `/sessions/{id}/ws` is an optional
@@ -122,12 +127,13 @@ upgrade request and a `token` frame refreshes it mid-socket.
 | Type                 | Direction | Payload                                     |
 |----------------------|-----------|---------------------------------------------|
 | user_message         | in        | text, attachments                           |
-| tool_result          | in        | tool_call_id, result                        |
+| tool_result          | in        | tool_call_id, ok, content, error?           |
 | approval_response    | in        | approval_id, allow/deny, remember (once | session), note |
+| hello                | in        | last_seq, level (WebSocket frame only; replaces Last-Event-ID + ?level= on open) |
 | cancel               | in        | turn_id                                     |
 | job_progress         | in        | job_id, pct, message (WebSocket frame; equals POST /sessions/{id}/jobs/{job_id}/progress) |
 | token                | in        | bearer (WebSocket frame only; refreshes the connection's token, same rules as a new bearer on any request) |
-| session_state        | out       | sent after every stream open: turn state, pending approvals, pending client calls (with args, deadline), active_team, chain layers, client tools |
+| session_state        | out       | sent after every stream open: turn state, this session's pending approvals, count of the owner's pending memory approvals in other sessions, pending client calls (with args, deadline), active_team, frozen, chain layers, client tools |
 | client_tools_registered | out    | names registered; shadows if any took an unlocked earlier-layer name |
 | tool_shadowed        | out       | tool name, the earlier-layer tool it now overrides, by layer |
 | stream_replaced      | out       | sent to the old connection when a new one opens for the same session |
@@ -136,13 +142,13 @@ upgrade request and a `token` frame refreshes it mid-socket.
 | token_expiring       | out       | expires_at                                  |
 | auth_expired         | out       | stream closes; reopen with a fresh token    |
 | turn_interrupted     | out       | turn_id, reason (service restart)           |
-| session_ended        | out       | reason: client | idle                       |
+| session_ended        | out       | reason: client | idle | exhausted; purge (true when DELETE) |
 | turn_started         | out       | turn_id, initiated_by: user | job (+ job_id) |
 | context_ready        | out       | per-layer timings, counts of skills/tools/memories loaded |
 | assistant_delta      | out       | text fragment                               |
 | assistant_message    | out       | full text, citations: memory ids with layer, skill ids |
 | tool_call_proposed   | out       | tool, args, execute_on, state=reviewing (first; audit pending) or state=execute (second, client tools only: run it now), static verdict if any |
-| approval_requested   | out       | approval_id, tool call, asked_by (rule/classifier, layer, locked), reason, remember_options, timeout |
+| approval_requested   | out       | approval_id, kind: tool | memory, tool call or candidate, asked_by { kind: rule | classifier | step, id, layer, locked }, reason, remember_options, remember_match, timeout |
 | approval_resolved    | out       | approval_id, decision, by, or timed_out/cancelled |
 | tool_call_denied     | out       | tool_call_id, reason                        |
 | audit_verdict        | out       | tool_call_id, source (rule id or model), decision, p_requested (debug-level) |
@@ -160,13 +166,13 @@ upgrade request and a `token` frame refreshes it mid-socket.
 | memory_decision      | in        | approval_id, accept_team / keep_personal / discard (same endpoint as tool approvals) |
 | memory_decision_resolved | out   | approval_id, decision or timed_out                |
 | memory_updated       | out       | memory id, layer (dedupe hit updated an existing memory) |
-| memory_discarded     | out       | candidate hash, reason (debug-level; off by default) |
+| memory_discarded     | out       | candidate hash, reason: no_layer_accepted | store_error | user | mining_failed (debug-level; off by default) |
 | skill_suggested      | out       | skill id, matched trigger (debug-level)     |
 | skill_loaded         | out       | skill id, name, layer, version, tools registered, auto? |
 | skill_unloaded       | out       | skill id, tools removed, reason: model | client | evicted |
 | skill_outdated       | out       | skill id, loaded version, current version   |
 | skill_shadowed       | out       | skill id, the id it overrides, stale, base_version, fork_base_version |
-| shadow_refused       | out       | accumulator, name, attempted_by layer, locked_by layer |
+| shadow_refused       | out       | accumulator, name, attempted_by layer, reason: locked (locked_by layer) | section (fragment section not allowed for that layer) |
 | skill_forked         | out       | new skill id, from, by (service-level, not per session) |
 | turn_complete        | out       | turn_id, usage, outcome (values listed after this table), cancelled? |
 | turn_flagged         | out       | turn_id, reason, layer (post-hoc flag from an on_turn_end step) |
@@ -192,11 +198,18 @@ Used by the `error` event (`code`) and as HTTP error bodies (`{ error: code, ...
 | `approval_conflict`         | HTTP 409           | approval already answered, expired, or unknown                     |
 | `no_pending_client_call`    | HTTP 409           | tool result for a call that is not awaiting the client             |
 | `exists` / `locked`         | HTTP 409           | skill/tool/fragment name taken, or base is locked (fork)           |
+| `conflict`                  | HTTP 409           | git writer merge conflict; client tools replaced while a client call is pending; rebase needs manual resolution |
+| `frozen`                    | HTTP 409           | session is frozen; unfreeze first                                  |
+| `resume_unavailable`        | HTTP 409           | `resume_from` names a session with no retained transcript          |
+| `team_not_in_groups`        | HTTP 403           | `active_team` or target team is not in the token's `groups`        |
+| `unauthorized` / `token_expired` | HTTP 401      | bearer missing/invalid, or expired; refresh with the IdP           |
+| `bad_request`               | HTTP 400           | malformed body or query (e.g. an `allow` client gate, unknown layer) |
+| `unprocessable`             | HTTP 422           | well-formed but not applicable (fork tools exceed ceiling without strip_excess, promote blocked by policy, Idempotency-Key reused with a different body) |
 | `invalid_args`              | tool result        | model's arguments failed schema validation                         |
 | `capability`                | tool result        | tool exceeds layer ceiling, path/host not permitted, builtin ref disallowed |
-| `timeout` / `rate_limited` / `cancelled` | tool result | as named                                                     |
+| `timeout` / `rate_limited` / `cancelled` / `interrupted` | tool result | as named; `interrupted` = service restart or reconnect cleared a pending client call |
 | `job_limit`                 | tool result        | `jobs.max_per_user` or `jobs.max_total` exceeded; the model may retry later |
-| `store_unavailable`         | event              | session store or event log write failed; turn failed               |
+| `store_unavailable`         | event + HTTP 503   | a write to the SessionStore, EventLog, JobStore, AssetStore, ApprovalStore, or AuditStore failed; turn failed |
 | `prompt_budget_exceeded`    | event + HTTP 500   | locked fragments alone exceed the model window; a misconfiguration |
 | `source_unavailable`        | event + HTTP 503   | a `required` source is down; turn failed                           |
 | `model_error`               | event              | provider returned a non-retryable error; turn failed               |
@@ -207,6 +220,9 @@ Used by the `error` event (`code`) and as HTTP error bodies (`{ error: code, ...
 
 - **One client, one session.** A session is created by a client and owned
   by it. There is no fan-out of one session's events to several clients.
+- **States**: `created | active | idle | exhausted | ended`; `GET
+  /sessions?state=` filters on them. Caps: `sessions.max_per_subject`
+  (20) and `sessions.create_rate` (10/min) per subject.
 - **Active team.** A session may carry `active_team`, set by the client
   at creation or changed later. It must be one of the token's groups. It
   is the main signal the memory routing steps use to send team-relevant
@@ -231,7 +247,10 @@ Used by the `error` event (`code`) and as HTTP error bodies (`{ error: code, ...
   `session_state` snapshot. Lifecycle, token refresh, restart, and
   end-of-session behaviour: `08-walkthrough.md` §11.
 - Approval requests therefore have exactly one responder: the owning
-  client.
+  client. Tool approvals live and die with the session; memory approvals
+  are owner-scoped (`ApprovalStore` keyed by owner), survive session end,
+  and can be listed and answered through `/approvals*` from any of the
+  owner's sessions.
 - Continuity between clients comes from the memory layers, not from
   session sharing. A user switching from CLI to web starts a new session
   and relies on memories (and optionally a session-summary memory) to
@@ -261,17 +280,21 @@ Used by the `error` event (`code`) and as HTTP error bodies (`{ error: code, ...
   | `GET /skills`, `GET /skills/{id}` | `use-{global,team,personal}-skill` (each filters its layer) |
   | `POST/PUT/DELETE /skills`         | `create-{global,team,personal}-skill` for the target layer; team writes also need the team in the token's `groups` claim |
   | `POST /skills/{id}/fork`, `/rebase` | `use-<base layer>-skill` plus `create-<target layer>-skill`; refused if the base is locked |
+  | `GET /skills/{id}/base`, `/diff`  | `use-<fork layer>-skill` plus `use-<base layer>-skill` |
+  | `GET /skills/{id}/resources/{path}` | `use-<layer>-skill` for the skill's layer; path confined to the skill folder |
   | `GET /memories`                   | `use-{team,personal}-memory` (each filters its layer); `use-global-memory` for the global layer |
+  | `GET /memories/{id}`              | membership rule: the id's layer must be in the caller's chain (global always; `team:T` needs T in `groups` + `use-team-memory`; `user` needs owner == subject); otherwise 404 |
   | `POST/DELETE /memories`, `/promote` | `create-{team,personal}-memory` for the target layer |
-  | `GET /prompt`, `/prompt/fragments` | any valid token (global fragments always; other layers by `use-<layer>-prompt`, proposed) |
-  | `POST/DELETE /prompt/fragments`   | `create-<layer>-prompt` (proposed)  |
-  | `GET /classifier/rules`           | any valid token (global rules always; other layers by `use-<layer>-classifier-rule`, proposed) |
-  | `POST/DELETE /classifier/rules`   | `create-<layer>-classifier-rule` (proposed) |
+  | `GET /prompt`, `/prompt/fragments` | any valid token (global fragments always; other layers by `use-<layer>-prompt`, proposed — open decision) |
+  | `POST/DELETE /prompt/fragments`   | `create-<layer>-prompt` (proposed — open decision)  |
+  | `GET /classifier/rules`           | any valid token (global rules always; other layers by `use-<layer>-classifier-rule`, proposed — open decision) |
+  | `POST/DELETE /classifier/rules`   | `create-<layer>-classifier-rule` (proposed — open decision; the walkthrough's rule-authoring and remembered-approval flows depend on it) |
   | `GET /classifier/verdicts`        | `read-audit` (own sessions) or `read-audit-all` |
-  | `GET /tools`                      | `use-<layer>-tool` (proposed)     |
-  | `POST/DELETE /tools`              | `create-<layer>-tool` (proposed)  |
+  | `GET /tools`                      | `use-<layer>-tool` (proposed — open decision) |
+  | `POST/DELETE /tools`              | `create-<layer>-tool` (proposed — open decision) |
   | `/sessions/*` (all)               | session owner (token `sub` == session owner); creation needs only a valid token |
-  | `/sessions/{id}/approvals/*`      | session owner                     |
+  | `/sessions/{id}/approvals/*`, `/approvals*` | session owner / approval owner |
+  | `GET /metrics`                    | none on loopback; `read-audit-all` otherwise |
   | `/sessions/{id}/tools`, `/gates`, `/assets`, `/skills/*` | session owner |
   | `/jobs/*`                         | job owner                         |
   | `POST /sources/refresh`, `GET /config/effective` | `manage-sources` (proposed) |

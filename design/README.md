@@ -6,6 +6,7 @@ needed. `GLOSSARY.md` fixes the vocabulary.
 | Order | Note | What it is |
 |---|---|---|
 | 1 | `00-vision.md` | Goals, non-goals, guiding principles |
+| 1b | `10-requirements.md` | The goals as testable statements; non-functional rows (targets are the owner's to fill) |
 | 2 | `07-turn-pipeline.md` | The spine: outer chain of layers, hook points, inner chains of steps, the turn context |
 | 3 | `01-core-abstractions.md` | The ports: token, memory, skill, prompt, tool, classifier, writers, asset store, identifiers, model client |
 | 4 | `04-auth-and-permissions.md` | OAuth2 login, scope-to-layer table, starting permissions, audit records |
@@ -17,8 +18,11 @@ needed. `GLOSSARY.md` fixes the vocabulary.
 | ref | `03-web-api.md` | Endpoints, event types, error catalogue, permission matrix |
 | ref | `GLOSSARY.md` | One meaning per term |
 
-Decisions live in `../decisions/` (numbered; later records may refine
-earlier ones). Open questions and the parking lot live in `../IDEAS.md`.
+Decisions live in `../decisions/` (0001–0016, numbered; later records
+may refine earlier ones; 0012–0016 record the policy, capability,
+approval, accepted-risk, and step-kind rules). Open questions, the
+decisions still needed from the owner, and the parking lot live in
+`../IDEAS.md`.
 
 ## Flow index
 
@@ -40,6 +44,9 @@ earlier ones). Open questions and the parking lot live in `../IDEAS.md`.
 | Skill discovery and loading | `08` §15 | `08` §15j |
 | Classifier engine and model client adapters | `08` §16 | `08` §16g |
 | Event bus and streaming | `08` §17 | `08` §17j |
+| Client-initiated skill load (system turn) | `08` §15d | `08` §15j |
+| Freeze and unfreeze | `08` §11 | – |
+| Owner-level approvals (memory approvals across sessions) | `08` §5g, §11c | `08` §6g |
 
 The list at the end of `08-walkthrough.md` ("Things this walkthrough
 pins down") is the one-page summary of every rule the flows forced.
